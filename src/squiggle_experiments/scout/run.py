@@ -346,16 +346,11 @@ def run_scout(config_path: str) -> str:
 
         # progress bar
         if (step % 10) == 0:
-            postfix = {
-                "loss": f"{rows[-1]['loss']:.2e}",
-                "gn": f"{grad_norm:.2e}",
-            }
+            postfix = {"loss": f"{rows[-1]['loss']:.2e}"}
             if probe_acc_A is not None:
-                postfix["pA"] = f"{probe_acc_A:.4f}"
-                postfix["pA_loss"] = f"{probe_loss_A:.2e}"
+                postfix["probeA_acc"] = f"{probe_acc_A:.4f}"
             if probe_acc_B is not None:
-                postfix["pB"] = f"{probe_acc_B:.4f}"
-                postfix["pB_loss"] = f"{probe_loss_B:.2e}"
+                postfix["probeB_acc"] = f"{probe_acc_B:.4f}"
             pbar.set_postfix(**postfix)
 
         # periodic capture (configurable source policy)
@@ -406,14 +401,17 @@ def run_scout(config_path: str) -> str:
     print(f"    Scalars:  {paths.metrics_scalar_path(run_id)}")
     print(f"    Samples:  {paths.samples_dir(run_id)}")
 
-    # last probe summary
     if "probe_acc_A" in df.columns and df["probe_acc_A"].notna().any():
-        lastA = df.dropna(subset=["probe_acc_A"]).iloc[-1]
-        msg = f"[probeA] step={int(lastA.step)} acc={lastA.probe_acc_A:.4f} loss={lastA.probe_loss_A:.6f}"
-        if "probe_acc_B" in df.columns and df["probe_acc_B"].notna().any():
-            lastB = df.dropna(subset=["probe_acc_B"]).iloc[-1]
-            msg += f" | [probeB] step={int(lastB.step)} acc={lastB.probe_acc_B:.4f} loss={lastB.probe_loss_B:.6f}"
-        print(msg)
+        lastA = df.dropna(subset=["probe_acc_A", "probe_loss_A"]).iloc[-1]
+        print(f"[probeA] step={int(lastA.step)} acc={lastA.probe_acc_A:.4f} loss={lastA.probe_loss_A:.6f}")
+    else:
+        print("[probeA] no probe rows logged")
+
+    if "probe_acc_B" in df.columns and df["probe_acc_B"].notna().any():
+        lastB = df.dropna(subset=["probe_acc_B", "probe_loss_B"]).iloc[-1]
+        print(f"[probeB] step={int(lastB.step)} acc={lastB.probe_acc_B:.4f} loss={lastB.probe_loss_B:.6f}")
+    else:
+        print("[probeB] no probe rows logged")
 
     return run_id
 
