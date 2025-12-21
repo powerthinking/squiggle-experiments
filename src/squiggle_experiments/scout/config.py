@@ -24,6 +24,22 @@ class InstrumentationCfg:
     layers: List[int] = field(default_factory=lambda: [0, 3])
 
 @dataclass(frozen=True)
+class ProbeEvalCfg:
+    every_steps: int = 50
+
+@dataclass(frozen=True)
+class TriggerRuleCfg:
+    type: str
+    threshold: float | None = None
+    min_drop: float | None = None
+    window_steps: int | None = None
+
+@dataclass(frozen=True)
+class TriggersCfg:
+    enabled: bool = False
+    rules: List[TriggerRuleCfg] = field(default_factory=list)
+
+@dataclass(frozen=True)
 class ScoutModelCfg:
     d_model: int = 128
     n_layers: int = 4
@@ -58,6 +74,9 @@ class ScoutCfg:
     capture: ScoutCaptureCfg = ScoutCaptureCfg(layers=[0, 3])
     probes: ProbesCfg = field(default_factory=ProbesCfg)
     instrumentation: InstrumentationCfg = field(default_factory=InstrumentationCfg)
+    probe_eval: ProbeEvalCfg = ProbeEvalCfg()
+    triggers: TriggersCfg = field(default_factory=TriggersCfg)
+
 
 
 def _coerce_model(d: Dict[str, Any]) -> ScoutModelCfg:

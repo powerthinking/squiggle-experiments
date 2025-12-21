@@ -1,15 +1,15 @@
 run_name: scout_tiny
 seed: 1337
-steps: 8000
-batch_size: 64
-lr: 0.003
+steps: 2000
+batch_size: 128
+lr: 0.001
 device: auto
 
 model:
   d_model: 256
   n_layers: 4
   n_heads: 4
-  d_ff: 256
+  d_ff: 1024
   dropout: 0.0
 
 task:
@@ -30,3 +30,15 @@ probes:
 instrumentation:
   include_embedding: true
   layers: [0, 3]
+
+probe_eval:
+  every_steps: 25
+
+triggers:
+  enabled: true
+  rules:
+    - type: "probe_acc_crosses"
+      threshold: 0.90
+    - type: "loss_drop"
+      min_drop: 0.25
+      window_steps: 200
