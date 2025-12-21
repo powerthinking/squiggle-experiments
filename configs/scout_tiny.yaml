@@ -1,6 +1,6 @@
 run_name: scout_tiny
 seed: 1337
-steps: 3000
+steps: 8000
 batch_size: 64
 lr: 0.003
 device: auto
@@ -13,10 +13,20 @@ model:
   dropout: 0.0
 
 task:
-  p: 97
+  p: 31
 
 capture:
   every_steps: 50
   layers: [0, 3]
   embeddings: true
   residuals: true
+
+probes:
+  fixed:
+    enabled: true
+    n_examples: 256
+    seed: 123
+
+instrumentation:
+  include_embedding: true
+  layers: [0, 3]

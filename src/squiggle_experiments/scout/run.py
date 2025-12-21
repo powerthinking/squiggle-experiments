@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 from typing import Dict, List
+import json
 
 import pandas as pd
 import torch
@@ -38,7 +39,9 @@ def _capture_step(
     layers_to_capture: List[int],
     capture_embeddings: bool,
     capture_residuals: bool,
+    source: str,
 ) -> None:
+
     """
     Minimal capture for thin slice:
       - embeddings: token+pos embedding output (B,T,D)
@@ -56,12 +59,15 @@ def _capture_step(
 
     out_dir = paths.samples_dir(run_id) / f"step_{step:06d}"
     out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "sample_meta.json").write_text(
+        json.dumps({"source": source}, indent=2)
+    )
 
     if capture_embeddings:
         torch.save(x.detach().cpu(), out_dir / "embed.pt")
 
     if capture_residuals:
-        for i, block in enumerate(model.blocks):
+        for i, block in enumerate(model.blocks):    
             x = block(x)
             if i in layers_to_capture:
                 torch.save(x.detach().cpu(), out_dir / f"resid_layer_{i:02d}.pt")
@@ -73,7 +79,24 @@ def run_scout(config_path: str) -> str:
 
     device = _pick_device(cfg.device)
 
+    run_id = make_run_id(cfg.run_name, cfg.seed)
+
     task = AdditionModTask(p=cfg.task.p)
+
+    probe_x = None
+    probe_y = None
+
+    if cfg.probes.fixed.enabled:
+        set_seed(cfg.probes.fixed.seed)
+
+        probe_x, probe_y = task.sample_batch(cfg.probes.fixed.n_examples, device=device)
+
+        probe_path = paths.run_dir(run_id) / "probe_fixed.pt"
+        probe_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"x": probe_x.detach().cpu(), "y": probe_y.detach().cpu()}, probe_path)
+
+        # Restore training seed
+        set_seed(cfg.seed)
 
     model_cfg = TinyTransformerConfig(
         vocab_size=task.vocab_size,
@@ -87,8 +110,6 @@ def run_scout(config_path: str) -> str:
 
     model = TinyTransformerLM(model_cfg).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=cfg.lr)
-
-    run_id = make_run_id(cfg.run_name, cfg.seed)
 
     # Meta.json
     meta_path = paths.run_dir(run_id) / "meta.json"
@@ -150,15 +171,21 @@ def run_scout(config_path: str) -> str:
             pbar.set_postfix(loss=f"{rows[-1]['loss']:.4f}")
 
         if step % cfg.capture.every_steps == 0:
+            is_probe = probe_x is not None
+            source = "probe_fixed" if is_probe else "train_batch"
+            capture_ids = probe_x if is_probe else x
+
             _capture_step(
                 run_id=run_id,
                 step=step,
                 model=model,
-                input_ids=x,
+                input_ids=capture_ids,
                 layers_to_capture=cfg.capture.layers,
                 capture_embeddings=cfg.capture.embeddings,
                 capture_residuals=cfg.capture.residuals,
+                source=source,
             )
+
 
     # Write scalars
     out_path = paths.metrics_scalar_path(run_id)

@@ -1,11 +1,27 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
 
+@dataclass(frozen=True)
+class FixedProbeCfg:
+    enabled: bool = True
+    n_examples: int = 256
+    seed: int = 123
+
+
+@dataclass(frozen=True)
+class ProbesCfg:
+    fixed: FixedProbeCfg = field(default_factory=FixedProbeCfg)
+
+
+@dataclass(frozen=True)
+class InstrumentationCfg:
+    include_embedding: bool = True
+    layers: List[int] = field(default_factory=lambda: [0, 3])
 
 @dataclass(frozen=True)
 class ScoutModelCfg:
@@ -40,6 +56,8 @@ class ScoutCfg:
     model: ScoutModelCfg = ScoutModelCfg()
     task: ScoutTaskCfg = ScoutTaskCfg()
     capture: ScoutCaptureCfg = ScoutCaptureCfg(layers=[0, 3])
+    probes: ProbesCfg = field(default_factory=ProbesCfg)
+    instrumentation: InstrumentationCfg = field(default_factory=InstrumentationCfg)
 
 
 def _coerce_model(d: Dict[str, Any]) -> ScoutModelCfg:
