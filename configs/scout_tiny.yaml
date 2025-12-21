@@ -1,0 +1,22 @@
+run_name: scout_tiny
+seed: 1337
+steps: 3000
+batch_size: 64
+lr: 0.003
+device: auto
+
+model:
+  d_model: 256
+  n_layers: 4
+  n_heads: 4
+  d_ff: 256
+  dropout: 0.0
+
+task:
+  p: 97
+
+capture:
+  every_steps: 50
+  layers: [0, 3]
+  embeddings: true
+  residuals: true
