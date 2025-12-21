@@ -26,6 +26,11 @@ probes:
     enabled: true
     n_examples: 256
     seed: 123
+  holdout:
+    enabled: true
+    n_examples: 256
+    seed: 456
+
 
 instrumentation:
   include_embedding: true
@@ -42,3 +47,6 @@ triggers:
     - type: "loss_drop"
       min_drop: 0.25
       window_steps: 200
+
+capture:
+  source: probe_fixed   # or "train_batch" or "mixed"

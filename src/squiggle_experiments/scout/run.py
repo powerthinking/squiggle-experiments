@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
-from typing import Dict, List
 import json
+from pathlib import Path
+from typing import List, Optional
 
 import pandas as pd
 import torch
@@ -11,7 +11,6 @@ import torch.optim as optim
 from tqdm import tqdm
 
 from squiggle_core import paths
-
 from squiggle_experiments.models.tiny_transformer import TinyTransformerConfig, TinyTransformerLM
 from squiggle_experiments.tasks.addition_mod import AdditionModTask
 from squiggle_experiments.utils.logging import write_meta_json
@@ -29,6 +28,7 @@ def _pick_device(device_setting: str) -> str:
     # auto
     return "cuda" if torch.cuda.is_available() else "cpu"
 
+
 @torch.no_grad()
 def _eval_probe(
     model: TinyTransformerLM,
@@ -40,7 +40,7 @@ def _eval_probe(
 
     Assumptions (common for LM training):
       - x: (B, T) token ids
-      - y: (B, T) target token ids (or same shape as x)
+      - y: (B, T) target token ids (same shape as x)
       - model(x) returns logits (B, T, V)
       - model.loss(x, y) returns scalar loss
     """
@@ -48,8 +48,7 @@ def _eval_probe(
 
     probe_loss = float(model.loss(x, y).detach().cpu().item())
 
-    # Try to get logits
-    logits = model(x)  # expects (B,T,V)
+    logits = model(x)  # (B,T,V)
     if isinstance(logits, (tuple, list)):
         logits = logits[0]
 
@@ -58,6 +57,7 @@ def _eval_probe(
     probe_acc = float(correct.detach().cpu().item())
 
     return {"probe_loss": probe_loss, "probe_acc": probe_acc}
+
 
 class TriggerManager:
     def __init__(self, rules: list[dict]):
@@ -70,7 +70,7 @@ class TriggerManager:
         Return list of trigger events:
           {"name": "...", "step": step, "reason": "..."}
         """
-        events = []
+        events: list[dict] = []
 
         loss = metrics.get("loss")
         probe_acc = metrics.get("probe_acc")
@@ -97,20 +97,23 @@ class TriggerManager:
                 min_drop = float(r.get("min_drop", 0.0))
                 window = int(r.get("window_steps", 200))
                 if loss is not None:
-                    # find loss from ~window steps ago (nearest)
                     past = [v for (s, v) in self._loss_history if s <= step - window]
                     if past:
                         past_loss = past[-1]
                         if (past_loss - float(loss)) >= min_drop:
-                            # allow refire but rate-limit a bit
-                            key = (rule_id, step // window)
+                            key = (rule_id, step // window)  # rate-limit
                             if key not in self._fired:
                                 events.append(
-                                    {"name": "loss_drop", "step": step, "reason": f"loss dropped {past_loss - float(loss):.3f} over {window} steps"}
+                                    {
+                                        "name": "loss_drop",
+                                        "step": step,
+                                        "reason": f"loss dropped {past_loss - float(loss):.3f} over {window} steps",
+                                    }
                                 )
                                 self._fired.add(key)
 
         return events
+
 
 @torch.no_grad()
 def _capture_step(
@@ -123,7 +126,6 @@ def _capture_step(
     capture_residuals: bool,
     source: str,
 ) -> None:
-
     """
     Minimal capture for thin slice:
       - embeddings: token+pos embedding output (B,T,D)
@@ -137,22 +139,42 @@ def _capture_step(
 
     tok = model.tok_emb(input_ids)
     pos_emb = model.pos_emb(pos)
-    x = tok + pos_emb
+    x = tok + pos_emb  # (B,T,D)
 
     out_dir = paths.samples_dir(run_id) / f"step_{step:06d}"
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "sample_meta.json").write_text(
-        json.dumps({"source": source}, indent=2)
-    )
 
+    (out_dir / "sample_meta.json").write_text(json.dumps({"source": source}, indent=2))
+
+    manifest = {
+        "run_id": run_id,
+        "step": step,
+        "source": source,
+        "tensors": {},
+    }
+
+    # Save tensors and record them in manifest
     if capture_embeddings:
         torch.save(x.detach().cpu(), out_dir / "embed.pt")
+        manifest["tensors"]["embed"] = {
+            "path": "embed.pt",
+            "shape": list(x.shape),
+            "dtype": str(x.dtype),
+        }
 
     if capture_residuals:
-        for i, block in enumerate(model.blocks):    
+        for i, block in enumerate(model.blocks):
             x = block(x)
             if i in layers_to_capture:
-                torch.save(x.detach().cpu(), out_dir / f"resid_layer_{i:02d}.pt")
+                fname = f"resid_layer_{i:02d}.pt"
+                torch.save(x.detach().cpu(), out_dir / fname)
+                manifest["tensors"][f"resid_layer_{i:02d}"] = {
+                    "path": fname,
+                    "shape": list(x.shape),
+                    "dtype": str(x.dtype),
+                }
+
+    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
 
 def run_scout(config_path: str) -> str:
@@ -165,30 +187,39 @@ def run_scout(config_path: str) -> str:
 
     task = AdditionModTask(p=cfg.task.p)
 
-    probe_x = None
-    probe_y = None
+    # ---- probes (A=fixed, B=holdout) ----
+    probe_x_A = probe_y_A = None
+    probe_x_B = probe_y_B = None
 
+    if getattr(cfg, "probes", None) and getattr(cfg.probes, "fixed", None) and cfg.probes.fixed.enabled:
+        set_seed(cfg.probes.fixed.seed)
+        probe_x_A, probe_y_A = task.sample_batch(cfg.probes.fixed.n_examples, device=device)
+
+        probe_path = paths.run_dir(run_id) / "probe_fixed_A.pt"
+        probe_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"x": probe_x_A.detach().cpu(), "y": probe_y_A.detach().cpu()}, probe_path)
+
+        set_seed(cfg.seed)  # restore training seed
+
+    if getattr(cfg, "probes", None) and getattr(cfg.probes, "holdout", None) and cfg.probes.holdout.enabled:
+        set_seed(cfg.probes.holdout.seed)
+        probe_x_B, probe_y_B = task.sample_batch(cfg.probes.holdout.n_examples, device=device)
+
+        probe_path = paths.run_dir(run_id) / "probe_fixed_B.pt"
+        probe_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"x": probe_x_B.detach().cpu(), "y": probe_y_B.detach().cpu()}, probe_path)
+
+        set_seed(cfg.seed)  # restore training seed
+
+    # ---- triggers ----
     trigger_mgr = None
     if getattr(cfg, "triggers", None) and cfg.triggers.enabled:
-        # convert dataclass rules to dicts if needed
         rules = []
-        for r in cfg.triggers.rules:    
+        for r in cfg.triggers.rules:
             rules.append(r.__dict__ if hasattr(r, "__dict__") else dict(r))
         trigger_mgr = TriggerManager(rules)
 
-
-    if cfg.probes.fixed.enabled:
-        set_seed(cfg.probes.fixed.seed)
-
-        probe_x, probe_y = task.sample_batch(cfg.probes.fixed.n_examples, device=device)
-
-        probe_path = paths.run_dir(run_id) / "probe_fixed.pt"
-        probe_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"x": probe_x.detach().cpu(), "y": probe_y.detach().cpu()}, probe_path)
-
-        # Restore training seed
-        set_seed(cfg.seed)
-
+    # ---- model ----
     model_cfg = TinyTransformerConfig(
         vocab_size=task.vocab_size,
         seq_len=task.seq_len,
@@ -202,7 +233,7 @@ def run_scout(config_path: str) -> str:
     model = TinyTransformerLM(model_cfg).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=cfg.lr)
 
-    # Meta.json
+    # ---- meta.json ----
     meta_path = paths.run_dir(run_id) / "meta.json"
     write_meta_json(
         meta_path,
@@ -229,13 +260,28 @@ def run_scout(config_path: str) -> str:
                 "layers": cfg.capture.layers,
                 "embeddings": cfg.capture.embeddings,
                 "residuals": cfg.capture.residuals,
+                "source": getattr(cfg.capture, "source", "probe_fixed"),
+            },
+            "probes": {
+                "fixed_A": {
+                    "enabled": bool(probe_x_A is not None),
+                    "n_examples": getattr(getattr(cfg.probes, "fixed", None), "n_examples", None),
+                    "seed": getattr(getattr(cfg.probes, "fixed", None), "seed", None),
+                    "path": str((paths.run_dir(run_id) / "probe_fixed_A.pt").resolve()),
+                },
+                "holdout_B": {
+                    "enabled": bool(probe_x_B is not None),
+                    "n_examples": getattr(getattr(cfg.probes, "holdout", None), "n_examples", None),
+                    "seed": getattr(getattr(cfg.probes, "holdout", None), "seed", None),
+                    "path": str((paths.run_dir(run_id) / "probe_fixed_B.pt").resolve()),
+                },
             },
             "config_path": str(Path(config_path).resolve()),
         },
     )
 
-    # Training loop + scalar logging
-    rows = []
+    # ---- training loop + scalar logging ----
+    rows: list[dict] = []
     pbar = tqdm(range(cfg.steps), desc=f"Scout[{run_id}] ({device})")
 
     model.train()
@@ -245,17 +291,25 @@ def run_scout(config_path: str) -> str:
         optimizer.zero_grad(set_to_none=True)
         loss = model.loss(x, y)
         loss.backward()
-        optimizer.step()
 
+        # grad norm (every step) before optimizer.step()
+        total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1e9)
+        grad_norm = float(total_norm.detach().cpu().item())
+
+        optimizer.step()
         lr = optimizer.param_groups[0]["lr"]
 
-        probe_loss = None
-        probe_acc = None
+        # probes (on cadence)
+        probe_loss_A = probe_acc_A = None
+        probe_loss_B = probe_acc_B = None
 
-        if (probe_x is not None) and (step % cfg.probe_eval.every_steps == 0):
-            m = _eval_probe(model, probe_x, probe_y)
-            probe_loss = m["probe_loss"]
-            probe_acc = m["probe_acc"]
+        if step % cfg.probe_eval.every_steps == 0:
+            if probe_x_A is not None:
+                mA = _eval_probe(model, probe_x_A, probe_y_A)
+                probe_loss_A, probe_acc_A = mA["probe_loss"], mA["probe_acc"]
+            if probe_x_B is not None:
+                mB = _eval_probe(model, probe_x_B, probe_y_B)
+                probe_loss_B, probe_acc_B = mB["probe_loss"], mB["probe_acc"]
 
         rows.append(
             {
@@ -263,22 +317,22 @@ def run_scout(config_path: str) -> str:
                 "step": step,
                 "loss": float(loss.detach().cpu().item()),
                 "lr": float(lr),
-                "probe_loss": probe_loss,
-                "probe_acc": probe_acc,
+                "grad_norm": grad_norm,
+                "probe_loss_A": probe_loss_A,
+                "probe_acc_A": probe_acc_A,
+                "probe_loss_B": probe_loss_B,
+                "probe_acc_B": probe_acc_B,
             }
         )
 
-
-
+        # triggers (use probe A as primary signal)
         if trigger_mgr is not None:
-            metrics = {"loss": float(rows[-1]["loss"]), "probe_acc": probe_acc}
+            metrics = {"loss": float(rows[-1]["loss"]), "probe_acc": probe_acc_A}
             trig_events = trigger_mgr.update(step, metrics)
 
             for ev in trig_events:
-                # Triggered capture (same capture_ids you already use for v0)
-                is_probe = probe_x is not None
-                capture_ids = probe_x if is_probe else x
-
+                # Triggered capture: default to probe A if available, else train batch
+                capture_ids = probe_x_A if probe_x_A is not None else x
                 _capture_step(
                     run_id=run_id,
                     step=step,
@@ -290,17 +344,45 @@ def run_scout(config_path: str) -> str:
                     source=f"trigger:{ev['name']}",
                 )
 
-
+        # progress bar
         if (step % 10) == 0:
-            postfix = {"loss": f"{rows[-1]['loss']:.4f}"}
-            if probe_acc is not None:
-                postfix["probe_acc"] = f"{probe_acc:.3f}"
-            pbar.set_postfix(**postfix) 
+            postfix = {
+                "loss": f"{rows[-1]['loss']:.2e}",
+                "gn": f"{grad_norm:.2e}",
+            }
+            if probe_acc_A is not None:
+                postfix["pA"] = f"{probe_acc_A:.4f}"
+                postfix["pA_loss"] = f"{probe_loss_A:.2e}"
+            if probe_acc_B is not None:
+                postfix["pB"] = f"{probe_acc_B:.4f}"
+                postfix["pB_loss"] = f"{probe_loss_B:.2e}"
+            pbar.set_postfix(**postfix)
 
+        # periodic capture (configurable source policy)
         if step % cfg.capture.every_steps == 0:
-            is_probe = probe_x is not None
-            source = "probe_fixed" if is_probe else "train_batch"
-            capture_ids = probe_x if is_probe else x
+            capture_source = getattr(cfg.capture, "source", "probe_fixed")
+
+            if capture_source == "train_batch":
+                capture_ids = x
+                source = "train_batch"
+
+            elif capture_source == "mixed":
+                # alternate between probe A (if available) and train batches
+                if (step // cfg.capture.every_steps) % 2 == 0 and probe_x_A is not None:
+                    capture_ids = probe_x_A
+                    source = "probe_fixed_A"
+                else:
+                    capture_ids = x
+                    source = "train_batch"
+
+            else:
+                # default: probe A if available, else train batch
+                if probe_x_A is not None:
+                    capture_ids = probe_x_A
+                    source = "probe_fixed_A"
+                else:
+                    capture_ids = x
+                    source = "train_batch"
 
             _capture_step(
                 run_id=run_id,
@@ -310,27 +392,33 @@ def run_scout(config_path: str) -> str:
                 layers_to_capture=cfg.capture.layers,
                 capture_embeddings=cfg.capture.embeddings,
                 capture_residuals=cfg.capture.residuals,
-                source=source,
+                source=capture_source,
             )
-
 
     # Write scalars
     out_path = paths.metrics_scalar_path(run_id)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(rows).to_parquet(out_path)
+    df = pd.DataFrame(rows)
+    df.to_parquet(out_path)
 
     print(f"[✓] Scout run complete: {run_id}")
     print(f"    Meta:     {paths.run_dir(run_id) / 'meta.json'}")
     print(f"    Scalars:  {paths.metrics_scalar_path(run_id)}")
     print(f"    Samples:  {paths.samples_dir(run_id)}")
-    df = pd.DataFrame(rows)
-    last_probe = df.dropna(subset=["probe_acc"]).iloc[-1]
-    print(f"[probe] step={int(last_probe.step)} acc={last_probe.probe_acc:.4f} loss={last_probe.probe_loss:.6f}")
-    
+
+    # last probe summary
+    if "probe_acc_A" in df.columns and df["probe_acc_A"].notna().any():
+        lastA = df.dropna(subset=["probe_acc_A"]).iloc[-1]
+        msg = f"[probeA] step={int(lastA.step)} acc={lastA.probe_acc_A:.4f} loss={lastA.probe_loss_A:.6f}"
+        if "probe_acc_B" in df.columns and df["probe_acc_B"].notna().any():
+            lastB = df.dropna(subset=["probe_acc_B"]).iloc[-1]
+            msg += f" | [probeB] step={int(lastB.step)} acc={lastB.probe_acc_B:.4f} loss={lastB.probe_loss_B:.6f}"
+        print(msg)
+
     return run_id
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Run Scout thin-slice training")
     parser.add_argument("--config", required=True, help="Path to scout YAML config")
     args = parser.parse_args()
