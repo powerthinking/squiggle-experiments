@@ -141,7 +141,7 @@ def _capture_step(
     pos_emb = model.pos_emb(pos)
     x = tok + pos_emb  # (B,T,D)
 
-    out_dir = paths.samples_dir(run_id) / f"step_{step:06d}"
+    out_dir = paths.captures_dir(run_id) / f"step_{step:06d}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     (out_dir / "sample_meta.json").write_text(json.dumps({"source": source}, indent=2))
@@ -391,15 +391,33 @@ def run_scout(config_path: str) -> str:
             )
 
     # Write scalars
-    out_path = paths.metrics_scalar_path(run_id)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(rows)
-    df.to_parquet(out_path)
+
+    wide_path = paths.metrics_wide_path(run_id)
+    wide_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(wide_path)
+
+    # Export long-form scalars (canonical contract)
+    wall_time = pd.Timestamp.now()
+    value_cols = [c for c in df.columns if c not in {"run_id", "step"}]
+    long_df = df.melt(
+        id_vars=["run_id", "step"],
+        value_vars=value_cols,
+        var_name="metric_name",
+        value_name="value",
+    )
+    long_df.insert(2, "wall_time", wall_time)
+    long_df = long_df.dropna(subset=["value"]).reset_index(drop=True)
+
+    scalar_path = paths.metrics_scalar_path(run_id)
+    scalar_path.parent.mkdir(parents=True, exist_ok=True)
+    long_df.to_parquet(scalar_path, index=False)
 
     print(f"[✓] Scout run complete: {run_id}")
     print(f"    Meta:     {paths.run_dir(run_id) / 'meta.json'}")
-    print(f"    Scalars:  {paths.metrics_scalar_path(run_id)}")
-    print(f"    Samples:  {paths.samples_dir(run_id)}")
+    print(f"    Scalars (wide): {paths.metrics_wide_path(run_id)}")
+    print(f"    Scalars (long): {paths.metrics_scalar_path(run_id)}")
+    print(f"    Captures: {paths.captures_dir(run_id)}")
 
     if "probe_acc_A" in df.columns and df["probe_acc_A"].notna().any():
         lastA = df.dropna(subset=["probe_acc_A", "probe_loss_A"]).iloc[-1]
