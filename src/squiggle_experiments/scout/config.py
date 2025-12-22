@@ -94,6 +94,7 @@ class ScoutCaptureCfg:
 
 @dataclass(frozen=True)
 class ScoutCfg:
+    run_id: Optional[str] = None
     run_name: str = "scout_tiny"
     seed: int = 1337
     steps: int = 500
@@ -190,6 +191,7 @@ def load_scout_config(path: str | Path) -> ScoutCfg:
     triggers = _coerce_triggers(raw.get("triggers", {}))
 
     return ScoutCfg(
+        run_id=(str(raw.get("run_id")) if raw.get("run_id") is not None else None),
         run_name=str(raw.get("run_name", "scout_tiny")),
         seed=int(raw.get("seed", 1337)),
         steps=int(raw.get("steps", 500)),

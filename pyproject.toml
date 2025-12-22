@@ -19,7 +19,11 @@ dependencies = [
   "tqdm>=4.66",
   "squiggle-core>=0.1.0",
   "squiggle-instrumentation>=0.1.0",
+  "squiggle-analysis>=0.1.0",
 ]
+
+[project.scripts]
+squiggle-run = "squiggle_experiments.run_and_analyze:main"
 
 [project.optional-dependencies]
 dev = [

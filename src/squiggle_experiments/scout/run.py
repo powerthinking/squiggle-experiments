@@ -183,7 +183,7 @@ def run_scout(config_path: str) -> str:
 
     device = _pick_device(cfg.device)
 
-    run_id = make_run_id(cfg.run_name, cfg.seed)
+    run_id = cfg.run_id if getattr(cfg, "run_id", None) else make_run_id(cfg.run_name, cfg.seed)
 
     task = AdditionModTask(p=cfg.task.p)
 
