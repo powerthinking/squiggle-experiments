@@ -21,9 +21,9 @@ Each path is constructed to isolate *one primary causal factor* while holding ot
 
 Each path below specifies:
 
-- **What it isolates** — the primary experimental variable  
-- **A/B variants** — the exact comparison  
-- **Hypothesis** — expected *squiggle-level* behavior (not just loss curves)
+- **What it isolates**: the primary experimental variable  
+- **A/B variants**: the exact comparison  
+- **Hypothesis**: expected *squiggle-level* behavior (not just loss curves)
 
 These hypotheses are intentionally falsifiable. A “null” outcome (no meaningful geometric difference) is considered a valid and informative result.
 
