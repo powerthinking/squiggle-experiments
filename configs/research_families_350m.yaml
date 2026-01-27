@@ -1,0 +1,86 @@
+# Research Training Config - 350M Model with Family Data
+# Full research run for squiggle detection experiments
+
+run_name: "research_families_350m"
+seed: 42
+device: "cuda:0"  # Use 24GB GPU
+
+model:
+  size: "350m"  # ~341M params
+  vocab_size: 50257  # GPT-2 tokenizer vocab size
+  max_seq_len: 256  # Reduced for memory
+
+data:
+  family_data_dir: "/home/todd/software/squiggle/aimo-math-corpus-proof-families/candidate_pool/slices/slice_omr_cot_shuffle_n5000_s42_990f251068d3/families"
+  families: null  # Use all families (target + control)
+  max_samples: null
+  shuffle_seed: 42
+
+training:
+  steps: 5000
+  batch_size: 2
+  gradient_accumulation_steps: 8  # Effective batch size: 16
+  lr: 3e-4
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  warmup_steps: 250
+  lr_schedule: cosine
+  min_lr_ratio: 0.1
+  max_grad_norm: 1.0
+
+scalars:
+  enabled: true
+  global_loss: true
+  per_task_loss: true
+  per_task_accuracy: true
+  grad_norm_global: true
+  grad_norm_per_block: false
+  lr: true
+
+checkpoints:
+  enabled: true
+  early_until_step: 1000
+  early_every_steps: 100
+  late_every_steps: 500
+  keep_last_n: 5
+  save_optimizer: true
+
+probes:
+  fixed:
+    enabled: true
+    n_examples: 16
+    seed: 123
+  extended:
+    enabled: true
+    n_examples: 32  # Reduced for memory
+    seed: 456
+    milestone_fractions: [0.1, 0.25, 0.5, 0.75, 1.0]  # Skip step 0
+  metrics:
+    embeddings_output: true
+    residual_stream: true
+    attention_stats: true
+    entropy: true
+    top_k_mass: true
+    top_k_values: [1, 5, 10]
+  layers: [0, 4, 8, 12, 16, 20, 23]
+  fixed_every_steps: 50
+
+activations:
+  enabled: true
+  early_until_step: 1000
+  early_every_steps: 250
+  mid_until_step: 3000
+  mid_every_steps: 500
+  late_every_steps: 1000
+  capture:
+    x_in: true
+    attn_out: true
+    x_mid: true
+    mlp_out: true
+    x_out: true
+  source: probe_fixed
+  probe_n_examples: 16
+  probe_seed: 123
+
+attention_matrices:
+  enabled: false  # DEFERRED

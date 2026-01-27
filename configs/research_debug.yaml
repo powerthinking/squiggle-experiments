@@ -1,0 +1,53 @@
+# Debug Research Training Configuration
+# Tiny model for fast iteration and pipeline testing
+
+run_name: "research_debug"
+seed: 42
+device: auto
+
+model:
+  size: "debug"  # Uses ~3.5M param model
+  vocab_size: 1000
+  max_seq_len: 256
+
+training:
+  steps: 100
+  batch_size: 4
+  gradient_accumulation_steps: 1
+  lr: 1e-3
+  warmup_steps: 10
+  max_grad_norm: 1.0
+
+scalars:
+  enabled: true
+  grad_norm_per_block: false
+
+checkpoints:
+  enabled: true
+  early_until_step: 50
+  early_every_steps: 10
+  late_every_steps: 25
+  keep_last_n: 3
+
+probes:
+  fixed:
+    enabled: true
+    n_examples: 32
+    seed: 123
+  extended:
+    enabled: true
+    n_examples: 64
+    seed: 456
+  layers: [0, 2, 3]
+  fixed_every_steps: 10
+
+activations:
+  enabled: true
+  early_until_step: 50
+  early_every_steps: 10
+  mid_until_step: 75
+  mid_every_steps: 15
+  late_every_steps: 25
+
+attention_matrices:
+  enabled: false

@@ -1,0 +1,59 @@
+# Research Training Config - Family Data (Debug)
+# Small model for testing the pipeline with real family data
+
+run_name: "research_families_debug"
+seed: 42
+device: auto
+
+model:
+  size: "debug"  # ~3.5M params for fast iteration
+  vocab_size: 50257  # GPT-2 tokenizer vocab size
+  max_seq_len: 256  # Reduced for memory
+
+data:
+  family_data_dir: "/home/todd/software/squiggle/aimo-math-corpus-proof-families/candidate_pool/slices/slice_omr_cot_shuffle_n5000_s42_990f251068d3/families"
+  families: null  # Use all families (target + control)
+  max_samples: null
+  shuffle_seed: 42
+
+training:
+  steps: 200
+  batch_size: 2
+  gradient_accumulation_steps: 2
+  lr: 1e-3
+  warmup_steps: 20
+  max_grad_norm: 1.0
+
+scalars:
+  enabled: true
+  grad_norm_per_block: false
+
+checkpoints:
+  enabled: true
+  early_until_step: 100
+  early_every_steps: 25
+  late_every_steps: 50
+  keep_last_n: 3
+
+probes:
+  fixed:
+    enabled: true
+    n_examples: 16
+    seed: 123
+  extended:
+    enabled: true
+    n_examples: 32
+    seed: 456
+  layers: [0, 2, 3]
+  fixed_every_steps: 25
+
+activations:
+  enabled: true
+  early_until_step: 100
+  early_every_steps: 25
+  mid_until_step: 150
+  mid_every_steps: 50
+  late_every_steps: 100
+
+attention_matrices:
+  enabled: false

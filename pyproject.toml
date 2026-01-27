@@ -24,6 +24,7 @@ dependencies = [
 
 [project.scripts]
 squiggle-run = "squiggle_experiments.run_and_analyze:main"
+squiggle-research = "squiggle_experiments.research.trainer:main"
 
 [project.optional-dependencies]
 dev = [
