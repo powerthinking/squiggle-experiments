@@ -8,7 +8,6 @@ from typing import Any, Dict, List, Literal, Optional
 
 import yaml
 
-
 # -------------------------
 # A. Scalars Config (every step)
 # -------------------------
@@ -189,6 +188,9 @@ class DataCfg:
     split: str = "cot"
     # Local family data directory (overrides dataset if set)
     family_data_dir: Optional[str] = None
+    # Training split directory (overrides family_data_dir if set)
+    # Should contain train.jsonl, val_random.jsonl, val_family.jsonl
+    split_dir: Optional[str] = None
     # Families to include (None = all)
     families: Optional[List[str]] = None
     # Data mixing
@@ -197,15 +199,39 @@ class DataCfg:
 
 
 # -------------------------
+# Curriculum config
+# -------------------------
+
+
+@dataclass(frozen=True)
+class CurriculumCfg:
+    """Configuration for curriculum-driven training.
+
+    When enabled, training samples are selected according to a time-varying
+    policy over problem families defined in a curriculum YAML spec.
+    """
+
+    enabled: bool = False
+    # Path to curriculum YAML spec (e.g., "curricula/family_ramp.yaml")
+    spec_path: Optional[str] = None
+    # Write sample trace for exact replay (can be large)
+    trace_enabled: bool = False
+    # Log family distribution every N steps (0 = disabled)
+    log_distribution_every: int = 100
+
+
+# -------------------------
 # Training config
 # -------------------------
+
 
 @dataclass(frozen=True)
 class TrainingCfg:
     """Training hyperparameters."""
 
-    # Basic
+    # Basic - use epochs OR steps (epochs takes precedence if set)
     steps: int = 50000
+    epochs: Optional[int] = None  # If set, overrides steps based on dataset size
     batch_size: int = 32
     gradient_accumulation_steps: int = 4
     # Optimizer
@@ -213,13 +239,17 @@ class TrainingCfg:
     weight_decay: float = 0.1
     betas: tuple = (0.9, 0.95)
     # LR schedule
-    warmup_steps: int = 500
+    warmup_steps: int = 500  # Used if warmup_fraction is None
+    warmup_fraction: Optional[float] = 0.05  # 5% of total steps (overrides warmup_steps)
     lr_schedule: Literal["cosine", "linear", "constant"] = "cosine"
-    min_lr_ratio: float = 0.1
+    min_lr_ratio: float = 0.1  # Floor for cosine decay (0.1 = 10% of base LR)
     # Precision
     dtype: Literal["fp32", "fp16", "bf16"] = "bf16"
     # Gradient clipping
     max_grad_norm: float = 1.0
+    # Validation
+    val_every_epoch: bool = True  # Run validation every epoch (if epochs set)
+    val_every_steps: Optional[int] = None  # Run validation every N steps (if step-based)
 
 
 # -------------------------
@@ -250,6 +280,9 @@ class ResearchCfg:
     activations: ActivationCheckpointCfg = field(default_factory=ActivationCheckpointCfg)  # D
     attention_matrices: AttentionMatrixCfg = field(default_factory=AttentionMatrixCfg)  # E (deferred)
 
+    # Curriculum-driven training
+    curriculum: CurriculumCfg = field(default_factory=CurriculumCfg)
+
 
 # -------------------------
 # Coercion helpers
@@ -279,6 +312,12 @@ def _coerce_training(d: Dict[str, Any]) -> TrainingCfg:
         dd["min_lr_ratio"] = float(dd["min_lr_ratio"])
     if "max_grad_norm" in dd:
         dd["max_grad_norm"] = float(dd["max_grad_norm"])
+    # Handle epochs (may be int or None)
+    if "epochs" in dd and dd["epochs"] is not None:
+        dd["epochs"] = int(dd["epochs"])
+    # Handle val_every_steps (may be int or None)
+    if "val_every_steps" in dd and dd["val_every_steps"] is not None:
+        dd["val_every_steps"] = int(dd["val_every_steps"])
     return TrainingCfg(**dd)
 
 
@@ -338,6 +377,10 @@ def _coerce_attention_matrices(d: Dict[str, Any]) -> AttentionMatrixCfg:
     return AttentionMatrixCfg(**(d or {}))
 
 
+def _coerce_curriculum(d: Dict[str, Any]) -> CurriculumCfg:
+    return CurriculumCfg(**(d or {}))
+
+
 # -------------------------
 # Loader
 # -------------------------
@@ -360,6 +403,7 @@ def load_research_config(path: str | Path) -> ResearchCfg:
         probes=_coerce_probes(raw.get("probes", {})),
         activations=_coerce_activations(raw.get("activations", {})),
         attention_matrices=_coerce_attention_matrices(raw.get("attention_matrices", {})),
+        curriculum=_coerce_curriculum(raw.get("curriculum", {})),
     )
 
 

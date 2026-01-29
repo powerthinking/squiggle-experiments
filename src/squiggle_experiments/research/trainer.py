@@ -11,25 +11,29 @@ Implements the A-E logging hierarchy:
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import math
+import shutil
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from squiggle_core import paths
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from squiggle_core import paths
 from squiggle_experiments.models.research_transformer import (
     ResearchTransformerConfig,
     ResearchTransformerLM,
-    get_research_config_350m,
     get_research_config_1b,
+    get_research_config_350m,
     get_research_config_debug,
 )
 from squiggle_experiments.utils.logging import write_meta_json
@@ -38,11 +42,48 @@ from squiggle_experiments.utils.seed import set_seed
 
 from .config import (
     ResearchCfg,
-    load_research_config,
-    get_research_default_config,
     get_research_debug_config,
+    get_research_default_config,
+    load_research_config,
 )
-from .data import FamilyDataset, get_tokenizer
+from .curriculum import CurriculumSampler, CurriculumSpec, write_curriculum_manifest
+from .data import FamilyDataset, SplitDataset, get_tokenizer
+
+# --- Checkpoint staging infrastructure ---
+# Save checkpoints to fast local SSD first, then move to final destination in background.
+# This avoids slow I/O blocking training when data dir is on a slow filesystem (e.g., WSL + Windows drive).
+
+_CHECKPOINT_STAGE_DIR = Path(tempfile.gettempdir()) / "squiggle-checkpoint-stage"
+_checkpoint_move_executor: Optional[ThreadPoolExecutor] = None
+
+
+def _get_checkpoint_executor() -> ThreadPoolExecutor:
+    """Get or create the background checkpoint move executor."""
+    global _checkpoint_move_executor
+    if _checkpoint_move_executor is None:
+        _checkpoint_move_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="ckpt-move"
+        )
+        atexit.register(_shutdown_checkpoint_executor)
+    return _checkpoint_move_executor
+
+
+def _shutdown_checkpoint_executor() -> None:
+    """Shutdown the checkpoint move executor, waiting for pending moves."""
+    global _checkpoint_move_executor
+    if _checkpoint_move_executor is not None:
+        _checkpoint_move_executor.shutdown(wait=True)
+        _checkpoint_move_executor = None
+
+
+def _move_checkpoint_background(src: Path, dst: Path) -> None:
+    """Move checkpoint from staging to final location (runs in background thread)."""
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dst))
+    except Exception as e:
+        # Log but don't crash - the staged file remains as backup
+        print(f"[Checkpoint] Warning: background move failed {src} -> {dst}: {e}")
 
 
 def _pick_device(device_setting: str) -> str:
@@ -172,7 +213,7 @@ def _compute_grad_norms(model: nn.Module, per_block: bool = False) -> Dict[str, 
     for p in model.parameters():
         if p.grad is not None:
             total_norm += p.grad.data.norm(2).item() ** 2
-    norms["grad_norm_global"] = total_norm ** 0.5
+    norms["grad_norm_global"] = total_norm**0.5
 
     # Per-block norms if requested
     if per_block and hasattr(model, "layers"):
@@ -181,7 +222,7 @@ def _compute_grad_norms(model: nn.Module, per_block: bool = False) -> Dict[str, 
             for p in layer.parameters():
                 if p.grad is not None:
                     block_norm += p.grad.data.norm(2).item() ** 2
-            norms[f"grad_norm_block_{i}"] = block_norm ** 0.5
+            norms[f"grad_norm_block_{i}"] = block_norm**0.5
 
     return norms
 
@@ -243,6 +284,70 @@ def _compute_probe_metrics(
 
 
 @torch.no_grad()
+def _evaluate_validation(
+    model: ResearchTransformerLM,
+    val_dataset: Dataset,
+    device: str,
+    batch_size: int = 4,
+    max_batches: int = 50,
+) -> Dict[str, float]:
+    """
+    Evaluate model on validation dataset.
+
+    Args:
+        model: Model to evaluate
+        val_dataset: Validation dataset
+        device: Device to use
+        batch_size: Batch size for evaluation
+        max_batches: Maximum batches to evaluate (for speed)
+
+    Returns:
+        Dict with val_loss and val_accuracy
+    """
+    model.eval()
+
+    dataloader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
+
+    total_loss = 0.0
+    total_correct = 0
+    total_tokens = 0
+    n_batches = 0
+
+    for batch in dataloader:
+        if n_batches >= max_batches:
+            break
+
+        input_ids = batch["input_ids"].to(device)
+        labels = batch["labels"].to(device)
+
+        logits, loss = model(input_ids, labels)
+
+        if loss is not None:
+            total_loss += loss.item()
+
+        # Token-level accuracy
+        preds = logits.argmax(dim=-1)
+        shift_preds = preds[..., :-1]
+        shift_labels = labels[..., 1:]
+        mask = shift_labels != -100
+        correct = ((shift_preds == shift_labels) & mask).float().sum().item()
+        total_tokens += mask.float().sum().item()
+        total_correct += correct
+
+        n_batches += 1
+
+    avg_loss = total_loss / max(n_batches, 1)
+    accuracy = total_correct / max(total_tokens, 1)
+
+    return {"val_loss": avg_loss, "val_accuracy": accuracy}
+
+
+@torch.no_grad()
 def _capture_activations(
     model: ResearchTransformerLM,
     input_ids: torch.Tensor,
@@ -290,7 +395,10 @@ def _capture_activations(
         if capture_cfg.attn_out:
             fname = f"layer_{i:02d}_attn_out.pt"
             torch.save(attn_out.detach().cpu(), out_dir / fname)
-            manifest["tensors"][f"layer_{i}_attn_out"] = {"path": fname, "shape": list(attn_out.shape)}
+            manifest["tensors"][f"layer_{i}_attn_out"] = {
+                "path": fname,
+                "shape": list(attn_out.shape),
+            }
 
         # x_mid: after attention + residual, before MLP
         x_mid = x + attn_out
@@ -304,7 +412,10 @@ def _capture_activations(
         if capture_cfg.mlp_out:
             fname = f"layer_{i:02d}_mlp_out.pt"
             torch.save(mlp_out.detach().cpu(), out_dir / fname)
-            manifest["tensors"][f"layer_{i}_mlp_out"] = {"path": fname, "shape": list(mlp_out.shape)}
+            manifest["tensors"][f"layer_{i}_mlp_out"] = {
+                "path": fname,
+                "shape": list(mlp_out.shape),
+            }
 
         # x_out: final block output
         x = x_mid + mlp_out
@@ -324,41 +435,83 @@ def _save_checkpoint(
     run_id: str,
     cfg: ResearchCfg,
 ) -> Path:
-    """Save model checkpoint."""
-    ckpt_dir = paths.run_dir(run_id) / "checkpoints"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    """Save model checkpoint.
 
-    ckpt_path = ckpt_dir / f"step_{step:06d}.pt"
+    Uses two-stage saving when the data directory is on a slow filesystem:
+    1. Save to fast local staging directory (SSD)
+    2. Move to final destination in background thread
+
+    This prevents slow I/O from blocking training.
+    """
+    final_ckpt_dir = paths.run_dir(run_id) / "checkpoints"
+    final_ckpt_dir.mkdir(parents=True, exist_ok=True)
+    final_ckpt_path = final_ckpt_dir / f"step_{step:06d}.pt"
 
     checkpoint = {
         "step": step,
         "model_state_dict": model.state_dict(),
-        "config": asdict(model.cfg) if hasattr(model.cfg, "__dataclass_fields__") else model.cfg.__dict__,
+        "config": asdict(model.cfg)
+        if hasattr(model.cfg, "__dataclass_fields__")
+        else model.cfg.__dict__,
     }
 
     if cfg.checkpoints.save_optimizer:
         checkpoint["optimizer_state_dict"] = optimizer.state_dict()
         checkpoint["scheduler_state_dict"] = scheduler.state_dict()
 
-    torch.save(checkpoint, ckpt_path)
+    # Check if we should use staging (when data dir is on a different filesystem)
+    stage_dir = _CHECKPOINT_STAGE_DIR / run_id
+    use_staging = not str(final_ckpt_dir).startswith("/tmp")
 
-    # Cleanup old checkpoints
+    if use_staging:
+        # Save to fast local staging directory
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        stage_path = stage_dir / f"step_{step:06d}.pt"
+        torch.save(checkpoint, stage_path)
+
+        # Move to final destination in background
+        executor = _get_checkpoint_executor()
+        executor.submit(_move_checkpoint_background, stage_path, final_ckpt_path)
+    else:
+        # Direct save (data dir is already on fast local storage)
+        torch.save(checkpoint, final_ckpt_path)
+
+    # Cleanup old checkpoints (in final location)
     if cfg.checkpoints.keep_last_n > 0:
-        existing = sorted(ckpt_dir.glob("step_*.pt"))
+        existing = sorted(final_ckpt_dir.glob("step_*.pt"))
         if len(existing) > cfg.checkpoints.keep_last_n:
             for old_ckpt in existing[: -cfg.checkpoints.keep_last_n]:
-                old_ckpt.unlink()
+                try:
+                    old_ckpt.unlink()
+                except FileNotFoundError:
+                    pass  # May not have been moved yet
 
-    return ckpt_path
+    return final_ckpt_path
 
 
-def run_research(config_path: Optional[str] = None, cfg: Optional[ResearchCfg] = None) -> str:
-    """Run research-grade training with comprehensive logging."""
+def run_research(
+    config_path: Optional[str] = None,
+    cfg: Optional[ResearchCfg] = None,
+    seed_override: Optional[int] = None,
+) -> str:
+    """Run research-grade training with comprehensive logging.
+
+    Args:
+        config_path: Path to YAML config file
+        cfg: Pre-loaded config (alternative to config_path)
+        seed_override: Override seed from config (useful for running same config with different seeds)
+    """
+    from dataclasses import replace
 
     if cfg is None:
         if config_path is None:
             raise ValueError("Must provide either config_path or cfg")
         cfg = load_research_config(config_path)
+
+    # Apply seed override if provided
+    if seed_override is not None:
+        cfg = replace(cfg, seed=seed_override)
+        print(f"Seed overridden to: {seed_override}")
 
     set_seed(cfg.seed)
 
@@ -375,31 +528,41 @@ def run_research(config_path: Optional[str] = None, cfg: Optional[ResearchCfg] =
 
     model = ResearchTransformerLM(model_cfg).to(device)
 
-    # Optimizer
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=cfg.training.lr,
-        betas=cfg.training.betas,
-        weight_decay=cfg.training.weight_decay,
-    )
-
-    # LR scheduler
-    total_steps = cfg.training.steps
-    if cfg.training.lr_schedule == "cosine":
-        scheduler = _get_cosine_schedule_with_warmup(
-            optimizer,
-            cfg.training.warmup_steps,
-            total_steps,
-            cfg.training.min_lr_ratio,
-        )
-    else:
-        # Constant or linear - for now just use constant
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
-
-    # Dataset setup
+    # Dataset setup (before optimizer/scheduler so we can compute total_steps from epochs)
     tokenizer = None
-    if cfg.data.family_data_dir:
-        # Use real family data
+    val_dataset = None
+    val_family_dataset = None
+
+    if cfg.data.split_dir:
+        # Use split directory (train.jsonl, val_random.jsonl, val_family.jsonl)
+        split_dir = Path(cfg.data.split_dir)
+        tokenizer = get_tokenizer(model_cfg.vocab_size)
+        dataset = SplitDataset(
+            split_dir=split_dir,
+            tokenizer=tokenizer,
+            max_seq_len=model_cfg.max_seq_len,
+            split_type="train",
+            max_samples=cfg.data.max_samples,
+            shuffle_seed=cfg.data.shuffle_seed,
+        )
+        # Also load validation sets
+        val_dataset = SplitDataset(
+            split_dir=split_dir,
+            tokenizer=tokenizer,
+            max_seq_len=model_cfg.max_seq_len,
+            split_type="val_random",
+            shuffle_seed=cfg.data.shuffle_seed,
+        )
+        val_family_dataset = SplitDataset(
+            split_dir=split_dir,
+            tokenizer=tokenizer,
+            max_seq_len=model_cfg.max_seq_len,
+            split_type="val_family",
+            shuffle_seed=cfg.data.shuffle_seed,
+        )
+        print(f"Using split dataset from {split_dir}")
+    elif cfg.data.family_data_dir:
+        # Use real family data (legacy mode)
         family_dir = Path(cfg.data.family_data_dir)
         tokenizer = get_tokenizer(model_cfg.vocab_size)
         dataset = FamilyDataset(
@@ -416,15 +579,114 @@ def run_research(config_path: Optional[str] = None, cfg: Optional[ResearchCfg] =
         dataset = DummyDataset(
             vocab_size=model_cfg.vocab_size,
             seq_len=model_cfg.max_seq_len,
-            size=cfg.training.steps * cfg.training.batch_size * cfg.training.gradient_accumulation_steps,
+            size=cfg.training.steps
+            * cfg.training.batch_size
+            * cfg.training.gradient_accumulation_steps,
             seed=cfg.seed,
         )
-        print("Using dummy dataset (no family_data_dir specified)")
+        print("Using dummy dataset (no split_dir or family_data_dir specified)")
 
+    # Compute total_steps (epochs take precedence over steps if set)
+    effective_batch_size = cfg.training.batch_size * cfg.training.gradient_accumulation_steps
+    steps_per_epoch = max(1, len(dataset) // effective_batch_size)
+
+    if cfg.training.epochs is not None:
+        total_steps = cfg.training.epochs * steps_per_epoch
+        print(
+            f"Training for {cfg.training.epochs} epochs = {total_steps} steps ({steps_per_epoch} steps/epoch)"
+        )
+    else:
+        total_steps = cfg.training.steps
+        n_epochs = total_steps / steps_per_epoch if steps_per_epoch > 0 else 0
+        print(
+            f"Training for {total_steps} steps = {n_epochs:.1f} epochs ({steps_per_epoch} steps/epoch)"
+        )
+
+    # Compute warmup_steps (fraction takes precedence)
+    if cfg.training.warmup_fraction is not None:
+        warmup_steps = int(cfg.training.warmup_fraction * total_steps)
+    else:
+        warmup_steps = cfg.training.warmup_steps
+    warmup_steps = max(1, warmup_steps)  # At least 1 step
+
+    # Compute phase boundaries for event analysis
+    # Phases: warmup (0 -> warmup_end), high_lr (warmup_end -> decay_start), decay (decay_start -> floor_start), floor
+    warmup_end_step = warmup_steps
+    if cfg.training.lr_schedule == "cosine":
+        # Cosine: decay starts after warmup, reaches floor near the end
+        # The "knee" is roughly where cosine drops to ~50% of range
+        decay_start_step = warmup_steps
+        # Floor is where LR is within 5% of min_lr
+        # For cosine: this is around 90% of the way through
+        floor_start_step = warmup_steps + int(0.9 * (total_steps - warmup_steps))
+    else:
+        # Constant: no decay phase
+        decay_start_step = total_steps
+        floor_start_step = total_steps
+
+    phase_boundaries = {
+        "warmup_end": warmup_end_step,
+        "decay_start": decay_start_step,
+        "floor_start": floor_start_step,
+        "total_steps": total_steps,
+    }
+
+    print(
+        f"LR schedule: {cfg.training.lr_schedule}, warmup={warmup_steps} steps ({100 * warmup_steps / total_steps:.1f}%)"
+    )
+    print(f"Phase boundaries: warmup_end={warmup_end_step}, floor_start={floor_start_step}")
+
+    # Optimizer
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=cfg.training.lr,
+        betas=cfg.training.betas,
+        weight_decay=cfg.training.weight_decay,
+    )
+
+    # LR scheduler
+    if cfg.training.lr_schedule == "cosine":
+        scheduler = _get_cosine_schedule_with_warmup(
+            optimizer,
+            warmup_steps,
+            total_steps,
+            cfg.training.min_lr_ratio,
+        )
+    else:
+        # Constant or linear - for now just use constant
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+
+    # Setup curriculum sampler if enabled
+    curriculum_sampler: Optional[CurriculumSampler] = None
+    curriculum_spec: Optional[CurriculumSpec] = None
+
+    if cfg.curriculum.enabled and cfg.curriculum.spec_path:
+        spec_path = Path(cfg.curriculum.spec_path)
+        if not spec_path.is_absolute():
+            # Look for curriculum specs relative to config file or cwd
+            spec_path = Path(cfg.curriculum.spec_path)
+        if not spec_path.exists():
+            print(f"Warning: Curriculum spec not found: {spec_path}, falling back to shuffle")
+        else:
+            curriculum_spec = CurriculumSpec.from_yaml(spec_path)
+            family_index = dataset.build_family_index()
+            curriculum_sampler = CurriculumSampler(
+                spec=curriculum_spec,
+                family_index=family_index,
+                total_steps=total_steps,
+                batch_size=cfg.training.batch_size,
+                seed=cfg.seed,
+            )
+            print(
+                f"Curriculum enabled: {curriculum_spec.name} ({len(curriculum_spec.phases)} phases)"
+            )
+
+    # Note: when using curriculum sampler, we sample batches manually in the loop
+    # So we create DataLoader with shuffle for fallback, but use sampler directly when available
     dataloader = DataLoader(
         dataset,
         batch_size=cfg.training.batch_size,
-        shuffle=True,
+        shuffle=(curriculum_sampler is None),  # Only shuffle when not using curriculum
         num_workers=0,
         pin_memory=True if device.startswith("cuda") else False,
     )
@@ -458,10 +720,18 @@ def run_research(config_path: Optional[str] = None, cfg: Optional[ResearchCfg] =
             "run_id": run_id,
             "run_name": cfg.run_name,
             "seed": cfg.seed,
-            "steps": cfg.training.steps,
+            "steps": total_steps,
+            "epochs": cfg.training.epochs,
+            "steps_per_epoch": steps_per_epoch,
             "batch_size": cfg.training.batch_size,
             "gradient_accumulation_steps": cfg.training.gradient_accumulation_steps,
+            "effective_batch_size": effective_batch_size,
             "lr": cfg.training.lr,
+            "lr_schedule": cfg.training.lr_schedule,
+            "warmup_steps": warmup_steps,
+            "warmup_fraction": cfg.training.warmup_fraction,
+            "min_lr_ratio": cfg.training.min_lr_ratio,
+            "phase_boundaries": phase_boundaries,
             "device": device,
             "model": {
                 "size": cfg.model.size,
@@ -473,9 +743,37 @@ def run_research(config_path: Optional[str] = None, cfg: Optional[ResearchCfg] =
                 "max_seq_len": model_cfg.max_seq_len,
                 "param_count": model_cfg.param_count(),
             },
+            "data": {
+                "split_dir": cfg.data.split_dir,
+                "family_data_dir": cfg.data.family_data_dir,
+                "train_size": len(dataset),
+                "val_random_size": len(val_dataset) if val_dataset else 0,
+                "val_family_size": len(val_family_dataset) if val_family_dataset else 0,
+            },
+            "curriculum": {
+                "enabled": curriculum_sampler is not None,
+                "spec_path": cfg.curriculum.spec_path if curriculum_sampler else None,
+                "spec_name": curriculum_spec.name if curriculum_spec else None,
+                "spec_hash": curriculum_spec.yaml_hash[:16] if curriculum_spec else None,
+                "phases": len(curriculum_spec.phases) if curriculum_spec else 0,
+            },
             "config_path": str(Path(config_path).resolve()) if config_path else None,
         },
     )
+
+    # Write curriculum manifest if enabled
+    if curriculum_sampler is not None and curriculum_spec is not None:
+        family_index = dataset.build_family_index()
+        family_counts = {f: len(indices) for f, indices in family_index.items()}
+        manifest = curriculum_spec.to_manifest(
+            total_steps=total_steps,
+            available_families=list(family_index.keys()),
+            family_counts=family_counts,
+            seed=cfg.seed,
+        )
+        manifest_path = paths.run_dir(run_id) / "curriculum_manifest.json"
+        write_curriculum_manifest(manifest, manifest_path)
+        print(f"Curriculum manifest written to {manifest_path}")
 
     # Training loop
     scalar_rows: List[Dict] = []
@@ -485,17 +783,35 @@ def run_research(config_path: Optional[str] = None, cfg: Optional[ResearchCfg] =
     accumulated_loss = 0.0
     accumulation_steps = 0
 
+    # Loss delta tracking
+    start_loss: Optional[float] = None
+    epoch_start_loss: Optional[float] = None
+    epoch_losses: Dict[int, Dict[str, float]] = {}  # epoch -> {start, end, delta}
+
     for step in pbar:
+        # Update curriculum sampler step if enabled
+        if curriculum_sampler is not None:
+            curriculum_sampler.set_step(step)
+
         # Gradient accumulation loop
         for _ in range(cfg.training.gradient_accumulation_steps):
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                data_iter = iter(dataloader)
-                batch = next(data_iter)
+            if curriculum_sampler is not None:
+                # Use curriculum sampler to get batch indices
+                batch_indices = curriculum_sampler.sample_batch()
+                # Manually collate batch from dataset
+                batch_items = [dataset[idx] for idx in batch_indices]
+                input_ids = torch.stack([item["input_ids"] for item in batch_items]).to(device)
+                labels = torch.stack([item["labels"] for item in batch_items]).to(device)
+            else:
+                # Standard dataloader iteration
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    data_iter = iter(dataloader)
+                    batch = next(data_iter)
 
-            input_ids = batch["input_ids"].to(device)
-            labels = batch["labels"].to(device)
+                input_ids = batch["input_ids"].to(device)
+                labels = batch["labels"].to(device)
 
             _, loss = model(input_ids, labels)
             loss = loss / cfg.training.gradient_accumulation_steps
@@ -521,6 +837,28 @@ def run_research(config_path: Optional[str] = None, cfg: Optional[ResearchCfg] =
         avg_loss = accumulated_loss
         accumulated_loss = 0.0
 
+        # Loss delta tracking
+        if start_loss is None:
+            start_loss = avg_loss
+        if epoch_start_loss is None:
+            epoch_start_loss = avg_loss
+
+        # Track epoch boundary (start of new epoch)
+        current_epoch = step // steps_per_epoch if steps_per_epoch > 0 else 0
+        prev_epoch = (step - 1) // steps_per_epoch if step > 0 and steps_per_epoch > 0 else 0
+
+        if step > 0 and current_epoch != prev_epoch:
+            # New epoch starting - store previous epoch's end loss
+            prev_epoch_num = prev_epoch
+            if prev_epoch_num not in epoch_losses:
+                epoch_losses[prev_epoch_num] = {"start": epoch_start_loss, "end": avg_loss}
+                epoch_losses[prev_epoch_num]["delta"] = (
+                    epoch_losses[prev_epoch_num]["start"] - epoch_losses[prev_epoch_num]["end"]
+                )
+
+            # Reset epoch tracking for new epoch
+            epoch_start_loss = avg_loss
+
         # Build scalar row
         row = {
             "run_id": run_id,
@@ -529,6 +867,22 @@ def run_research(config_path: Optional[str] = None, cfg: Optional[ResearchCfg] =
             "lr": current_lr,
         }
         row.update(grad_norms)
+
+        # Add curriculum phase info if enabled
+        if curriculum_sampler is not None:
+            current_phase = curriculum_sampler._get_current_phase()
+            if current_phase is not None:
+                row["curriculum_phase"] = current_phase.name
+
+            # Log distribution periodically
+            if (
+                cfg.curriculum.log_distribution_every > 0
+                and step % cfg.curriculum.log_distribution_every == 0
+                and step > 0
+            ):
+                if current_phase is not None:
+                    weights = curriculum_sampler._get_current_weights(current_phase)
+                    print(f"Step {step} - Phase: {current_phase.name}, Weights: {weights}")
 
         # Fixed probe evaluation
         if cfg.probes.fixed.enabled and step % cfg.probes.fixed_every_steps == 0:
@@ -551,6 +905,44 @@ def run_research(config_path: Optional[str] = None, cfg: Optional[ResearchCfg] =
                     row[f"probe_{k}"] = float(v)
             model.train()
 
+        # Validation at epoch boundaries (or step intervals)
+        run_val = False
+        current_epoch = step // steps_per_epoch if steps_per_epoch > 0 else 0
+
+        if cfg.training.epochs is not None and cfg.training.val_every_epoch:
+            # Run validation at the end of each epoch
+            if step > 0 and (step + 1) % steps_per_epoch == 0:
+                run_val = True
+        elif cfg.training.val_every_steps is not None:
+            # Run validation every N steps
+            if step > 0 and step % cfg.training.val_every_steps == 0:
+                run_val = True
+
+        if run_val and val_dataset is not None:
+            val_metrics = _evaluate_validation(model, val_dataset, device)
+            row["val_random_loss"] = val_metrics["val_loss"]
+            row["val_random_acc"] = val_metrics["val_accuracy"]
+
+            if val_family_dataset is not None:
+                val_family_metrics = _evaluate_validation(model, val_family_dataset, device)
+                row["val_family_loss"] = val_family_metrics["val_loss"]
+                row["val_family_acc"] = val_family_metrics["val_accuracy"]
+
+            # Show loss delta for this epoch
+            epoch_delta_str = ""
+            if current_epoch in epoch_losses:
+                delta = epoch_losses[current_epoch]["delta"]
+                epoch_delta_str = f", delta={delta:.4f}"
+
+            print(
+                f"\n[Epoch {current_epoch + 1}] Val-random: loss={val_metrics['val_loss']:.4f}, acc={val_metrics['val_accuracy']:.4f}{epoch_delta_str}"
+            )
+            if val_family_dataset is not None:
+                print(
+                    f"           Val-family: loss={val_family_metrics['val_loss']:.4f}, acc={val_family_metrics['val_accuracy']:.4f}"
+                )
+            model.train()
+
         scalar_rows.append(row)
 
         # Progress bar
@@ -567,11 +959,24 @@ def run_research(config_path: Optional[str] = None, cfg: Optional[ResearchCfg] =
 
         # Activation capture
         if _should_capture_activations(step, cfg):
-            capture_input = probe_fixed[:cfg.activations.probe_n_examples] if probe_fixed is not None else input_ids
+            capture_input = (
+                probe_fixed[: cfg.activations.probe_n_examples]
+                if probe_fixed is not None
+                else input_ids
+            )
             _capture_activations(model, capture_input, run_id, step, cfg)
 
     # Final checkpoint
     _save_checkpoint(model, optimizer, scheduler, total_steps, run_id, cfg)
+
+    # Record final epoch loss delta
+    final_epoch = total_steps // steps_per_epoch if steps_per_epoch > 0 else 0
+    if final_epoch not in epoch_losses and epoch_start_loss is not None:
+        epoch_losses[final_epoch] = {
+            "start": epoch_start_loss,
+            "end": avg_loss,
+            "delta": epoch_start_loss - avg_loss,
+        }
 
     # Write scalars
     df = pd.DataFrame(scalar_rows)
@@ -580,11 +985,44 @@ def run_research(config_path: Optional[str] = None, cfg: Optional[ResearchCfg] =
     scalar_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(scalar_path, index=False)
 
+    # Loss delta summary
+    end_loss = avg_loss
+    total_delta = (start_loss - end_loss) if start_loss is not None else 0.0
+
     print(f"\n[✓] Research run complete: {run_id}")
+    print("\n--- Loss Summary ---")
+    print(f"Start loss:  {start_loss:.4f}" if start_loss else "Start loss:  N/A")
+    print(f"End loss:    {end_loss:.4f}")
+    print(f"Total delta: {total_delta:.4f}")
+    if epoch_losses:
+        print("\nPer-epoch deltas:")
+        for epoch_num in sorted(epoch_losses.keys()):
+            ep_data = epoch_losses[epoch_num]
+            print(
+                f"  Epoch {epoch_num + 1}: {ep_data['start']:.4f} -> {ep_data['end']:.4f} (delta={ep_data['delta']:.4f})"
+            )
+
+        # Check validity: epoch 1 should have biggest delta
+        if len(epoch_losses) > 1:
+            epoch1_delta = epoch_losses.get(0, {}).get("delta", 0)
+            later_deltas = [epoch_losses[e]["delta"] for e in epoch_losses if e > 0]
+            if later_deltas and epoch1_delta > 0:
+                if epoch1_delta > max(later_deltas):
+                    print("  [OK] Epoch 1 has largest delta - healthy learning")
+                else:
+                    print("  [WARN] Epoch 1 delta smaller than later epochs - check LR")
     print(f"    Meta: {meta_path}")
     print(f"    Scalars: {scalar_path}")
     print(f"    Checkpoints: {paths.run_dir(run_id) / 'checkpoints'}")
     print(f"    Captures: {paths.captures_dir(run_id)}")
+
+    # Wait for any pending checkpoint moves to complete and cleanup staging
+    if _checkpoint_move_executor is not None:
+        _checkpoint_move_executor.shutdown(wait=True)
+        # Cleanup staging directory for this run
+        stage_dir = _CHECKPOINT_STAGE_DIR / run_id
+        if stage_dir.exists():
+            shutil.rmtree(stage_dir, ignore_errors=True)
 
     return run_id
 

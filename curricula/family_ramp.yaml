@@ -1,0 +1,122 @@
+# Family-Ramp Curriculum
+# Three-phase curriculum: targets only → ramp in controls → full mix
+#
+# Use this curriculum to study phase transitions and squiggle topology changes.
+# Starts with target families only, then gradually introduces control families,
+# then transitions to full proportional mixing.
+#
+# Target families (6): functional_equations, bijection_counting, modular_arithmetic,
+#                      graph_recurrence, invariant_monovariant, cyclic_groups
+# Control families (11): geometry_euclidean, calculus_analysis, optimization,
+#                        algebra_polynomials, misc_other, sequences_series,
+#                        probability_expectation, combinatorics_basic, inequalities,
+#                        number_theory_basic, logic_proof
+
+version: 1
+name: family_ramp_v1
+time_unit: steps
+
+defaults:
+  sampling:
+    mode: balanced_family
+    replacement: true
+
+phases:
+  # Phase 1: Target families only (first 30%)
+  - name: phase_1_targets_only
+    start: 0.0
+    end: 0.30
+    families:
+      include:
+        - functional_equations
+        - bijection_counting
+        - modular_arithmetic
+        - graph_recurrence
+        - invariant_monovariant
+        - cyclic_groups
+    weights:
+      type: uniform
+    sampling:
+      mode: balanced_family
+
+  # Phase 2: Ramp in control families (30-70%)
+  # Gradually increase weight of controls from 0 to 1
+  - name: phase_2_ramp_controls
+    start: 0.30
+    end: 0.70
+    families:
+      include:
+        # Targets
+        - functional_equations
+        - bijection_counting
+        - modular_arithmetic
+        - graph_recurrence
+        - invariant_monovariant
+        - cyclic_groups
+        # Controls
+        - geometry_euclidean
+        - calculus_analysis
+        - optimization
+        - algebra_polynomials
+        - misc_other
+        - sequences_series
+        - probability_expectation
+        - combinatorics_basic
+        - inequalities
+        - number_theory_basic
+        - logic_proof
+    weights:
+      type: ramp
+      ramp:
+        from:
+          # Targets start at full weight
+          functional_equations: 1.0
+          bijection_counting: 1.0
+          modular_arithmetic: 1.0
+          graph_recurrence: 1.0
+          invariant_monovariant: 1.0
+          cyclic_groups: 1.0
+          # Controls start at zero
+          geometry_euclidean: 0.0
+          calculus_analysis: 0.0
+          optimization: 0.0
+          algebra_polynomials: 0.0
+          misc_other: 0.0
+          sequences_series: 0.0
+          probability_expectation: 0.0
+          combinatorics_basic: 0.0
+          inequalities: 0.0
+          number_theory_basic: 0.0
+          logic_proof: 0.0
+        to:
+          # Both targets and controls at equal weight
+          functional_equations: 1.0
+          bijection_counting: 1.0
+          modular_arithmetic: 1.0
+          graph_recurrence: 1.0
+          invariant_monovariant: 1.0
+          cyclic_groups: 1.0
+          geometry_euclidean: 1.0
+          calculus_analysis: 1.0
+          optimization: 1.0
+          algebra_polynomials: 1.0
+          misc_other: 1.0
+          sequences_series: 1.0
+          probability_expectation: 1.0
+          combinatorics_basic: 1.0
+          inequalities: 1.0
+          number_theory_basic: 1.0
+          logic_proof: 1.0
+    sampling:
+      mode: balanced_family
+
+  # Phase 3: Full proportional mix (70-100%)
+  - name: phase_3_full_mix
+    start: 0.70
+    end: 1.0
+    families:
+      include: "*"
+    weights:
+      type: proportional
+    sampling:
+      mode: proportional_family

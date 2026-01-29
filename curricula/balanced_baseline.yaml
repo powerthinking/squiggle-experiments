@@ -1,0 +1,26 @@
+# Balanced Baseline Curriculum
+# Single phase using balanced_family sampling (all families weighted equally)
+#
+# Use this curriculum when you want each family to have equal representation
+# regardless of the number of items per family. Prevents large families from
+# dominating training.
+
+version: 1
+name: balanced_baseline
+time_unit: steps
+
+defaults:
+  sampling:
+    mode: balanced_family
+    replacement: true
+
+phases:
+  - name: full_balanced
+    start: 0.0
+    end: 1.0
+    families:
+      include: "*"
+    weights:
+      type: uniform
+    sampling:
+      mode: balanced_family

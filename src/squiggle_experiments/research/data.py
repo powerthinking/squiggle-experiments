@@ -2,6 +2,8 @@
 
 Supports loading math problems from family-specific JSONL files and
 tokenizing them for causal language model training.
+
+Also supports loading from split directories (train.jsonl, val_random.jsonl, val_family.jsonl).
 """
 
 from __future__ import annotations
@@ -9,10 +11,36 @@ from __future__ import annotations
 import json
 import random
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Literal, Optional
 
 import torch
 from torch.utils.data import Dataset, IterableDataset
+
+
+def load_split_data(
+    split_dir: Path,
+    split_type: Literal["train", "val_random", "val_family"] = "train",
+) -> List[Dict[str, Any]]:
+    """
+    Load data from a training split directory.
+
+    Args:
+        split_dir: Directory containing train.jsonl, val_random.jsonl, val_family.jsonl
+        split_type: Which split to load
+
+    Returns:
+        List of items from the specified split
+    """
+    split_file = split_dir / f"{split_type}.jsonl"
+    if not split_file.exists():
+        raise FileNotFoundError(f"Split file not found: {split_file}")
+
+    items = []
+    with split_file.open() as f:
+        for line in f:
+            items.append(json.loads(line))
+
+    return items
 
 
 def load_family_data(
@@ -72,6 +100,102 @@ def format_problem_for_training(item: Dict[str, Any]) -> str:
         return f"Problem: {problem}\n\nSolution: {solution}"
     else:
         return f"Problem: {problem}"
+
+
+class SplitDataset(Dataset):
+    """Dataset that loads from a split directory (train.jsonl, val_random.jsonl, etc.)."""
+
+    def __init__(
+        self,
+        split_dir: Path,
+        tokenizer: Any,
+        max_seq_len: int = 2048,
+        split_type: Literal["train", "val_random", "val_family"] = "train",
+        max_samples: Optional[int] = None,
+        shuffle_seed: int = 42,
+    ):
+        """
+        Args:
+            split_dir: Directory containing train.jsonl, val_random.jsonl, val_family.jsonl
+            tokenizer: HuggingFace tokenizer or compatible
+            max_seq_len: Maximum sequence length
+            split_type: Which split to load ("train", "val_random", "val_family")
+            max_samples: Maximum samples to use (None = all)
+            shuffle_seed: Seed for shuffling
+        """
+        self.tokenizer = tokenizer
+        self.max_seq_len = max_seq_len
+
+        # Load data from split file
+        items = load_split_data(split_dir, split_type)
+
+        # Extract family IDs from items (set during split creation)
+        self.items = items
+        self.family_ids = [item.get("_family_id", "unknown") for item in items]
+
+        # Shuffle
+        rng = random.Random(shuffle_seed)
+        indices = list(range(len(self.items)))
+        rng.shuffle(indices)
+        self.items = [self.items[i] for i in indices]
+        self.family_ids = [self.family_ids[i] for i in indices]
+
+        # Limit samples
+        if max_samples is not None and max_samples < len(self.items):
+            self.items = self.items[:max_samples]
+            self.family_ids = self.family_ids[:max_samples]
+
+        print(f"SplitDataset ({split_type}): {len(self.items)} items")
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        item = self.items[idx]
+        family_id = self.family_ids[idx]
+
+        # Format text
+        text = format_problem_for_training(item)
+
+        # Tokenize
+        encoding = self.tokenizer(
+            text,
+            truncation=True,
+            max_length=self.max_seq_len,
+            padding="max_length",
+            return_tensors="pt",
+        )
+
+        input_ids = encoding["input_ids"].squeeze(0)
+
+        return {
+            "input_ids": input_ids,
+            "labels": input_ids.clone(),
+            "family_id": family_id,
+        }
+
+    def build_family_index(self) -> Dict[str, List[int]]:
+        """Build mapping from family_id to dataset indices.
+
+        Returns:
+            Dict mapping family_id to list of dataset indices for that family.
+            Used by CurriculumSampler for family-aware batch sampling.
+        """
+        index: Dict[str, List[int]] = {}
+        for idx, family_id in enumerate(self.family_ids):
+            if family_id not in index:
+                index[family_id] = []
+            index[family_id].append(idx)
+        return index
+
+    def get_family_counts(self) -> Dict[str, int]:
+        """Get count of items per family.
+
+        Returns:
+            Dict mapping family_id to number of items.
+        """
+        index = self.build_family_index()
+        return {family_id: len(indices) for family_id, indices in index.items()}
 
 
 class FamilyDataset(Dataset):
@@ -151,6 +275,29 @@ class FamilyDataset(Dataset):
             "labels": input_ids.clone(),
             "family_id": family_id,
         }
+
+    def build_family_index(self) -> Dict[str, List[int]]:
+        """Build mapping from family_id to dataset indices.
+
+        Returns:
+            Dict mapping family_id to list of dataset indices for that family.
+            Used by CurriculumSampler for family-aware batch sampling.
+        """
+        index: Dict[str, List[int]] = {}
+        for idx, family_id in enumerate(self.family_ids):
+            if family_id not in index:
+                index[family_id] = []
+            index[family_id].append(idx)
+        return index
+
+    def get_family_counts(self) -> Dict[str, int]:
+        """Get count of items per family.
+
+        Returns:
+            Dict mapping family_id to number of items.
+        """
+        index = self.build_family_index()
+        return {family_id: len(indices) for family_id, indices in index.items()}
 
 
 class InfiniteFamilyDataset(IterableDataset):

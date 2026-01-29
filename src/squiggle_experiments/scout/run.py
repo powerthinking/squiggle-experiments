@@ -177,8 +177,16 @@ def _capture_step(
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
 
-def run_scout(config_path: str) -> str:
+def run_scout(config_path: str, seed_override: Optional[int] = None) -> str:
+    from dataclasses import replace
+
     cfg = load_scout_config(config_path)
+
+    # Apply seed override if provided
+    if seed_override is not None:
+        cfg = replace(cfg, seed=seed_override)
+        print(f"Seed overridden to: {seed_override}")
+
     set_seed(cfg.seed)
 
     device = _pick_device(cfg.device)

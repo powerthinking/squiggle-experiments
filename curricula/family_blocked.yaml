@@ -1,0 +1,88 @@
+# Family-Blocked Curriculum
+# Sequential phases, one family at a time (hard switches)
+#
+# Use this curriculum to study family-specific reorganization effects.
+# Each family gets dedicated training time before moving to the next.
+# Useful for measuring how learning on one family affects representations.
+
+version: 1
+name: family_blocked
+time_unit: steps
+
+defaults:
+  sampling:
+    mode: balanced_family
+    replacement: true
+
+phases:
+  # Target families first (6 families, ~10% each = 60% total)
+  - name: phase_1_functional_equations
+    start: 0.0
+    end: 0.10
+    families:
+      include: [functional_equations]
+    weights:
+      type: uniform
+    sampling:
+      mode: uniform_item
+
+  - name: phase_2_bijection_counting
+    start: 0.10
+    end: 0.20
+    families:
+      include: [bijection_counting]
+    weights:
+      type: uniform
+    sampling:
+      mode: uniform_item
+
+  - name: phase_3_modular_arithmetic
+    start: 0.20
+    end: 0.30
+    families:
+      include: [modular_arithmetic]
+    weights:
+      type: uniform
+    sampling:
+      mode: uniform_item
+
+  - name: phase_4_graph_recurrence
+    start: 0.30
+    end: 0.40
+    families:
+      include: [graph_recurrence]
+    weights:
+      type: uniform
+    sampling:
+      mode: uniform_item
+
+  - name: phase_5_invariant_monovariant
+    start: 0.40
+    end: 0.50
+    families:
+      include: [invariant_monovariant]
+    weights:
+      type: uniform
+    sampling:
+      mode: uniform_item
+
+  - name: phase_6_cyclic_groups
+    start: 0.50
+    end: 0.60
+    families:
+      include: [cyclic_groups]
+    weights:
+      type: uniform
+    sampling:
+      mode: uniform_item
+
+  # Final phase: all families mixed (consolidation)
+  - name: phase_7_full_mix
+    start: 0.60
+    end: 1.0
+    families:
+      include: "*"
+    weights:
+      type: uniform
+    sampling:
+      mode: balanced_family

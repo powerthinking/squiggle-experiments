@@ -1,0 +1,25 @@
+# IID Baseline Curriculum
+# Single phase using proportional_family sampling (matches underlying distribution)
+#
+# Use this curriculum as a baseline to compare against structured curricula.
+# Families are sampled proportional to their item counts in the dataset.
+
+version: 1
+name: iid_baseline
+time_unit: steps
+
+defaults:
+  sampling:
+    mode: proportional_family
+    replacement: true
+
+phases:
+  - name: full_iid
+    start: 0.0
+    end: 1.0
+    families:
+      include: "*"
+    weights:
+      type: proportional
+    sampling:
+      mode: proportional_family
