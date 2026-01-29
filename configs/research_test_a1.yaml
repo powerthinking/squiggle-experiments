@@ -1,0 +1,108 @@
+# Research Test A1: Step-based training config
+#
+# Canonical step budget with extension ladder support.
+# ~22 steps/epoch with current dataset (1408 samples, effective batch 64)
+#
+# Usage:
+#   python -m squiggle_experiments --config configs/research_test_a1.yaml --seed 42
+#   python -m squiggle_experiments --config configs/research_test_a1.yaml --seed 42 --step-multiplier 2.0
+
+run_name: "research_test_a1"
+seed: 42  # Default seed (override with --seed on command line)
+device: "cuda:0"
+
+model:
+  size: "350m"
+  vocab_size: 50257
+  max_seq_len: 256
+
+data:
+  split_dir: "/home/todd/software/squiggle/data/candidate_pool/splits/split_v1_s42"
+
+training:
+  # Step budget (canonical) - ~17 epochs at 22 steps/epoch
+  total_steps: 374
+  # step_multiplier: 1.0  # Override via CLI: --step-multiplier 2.0
+
+  batch_size: 2
+  gradient_accumulation_steps: 32  # effective batch = 64
+
+  # Optimizer
+  lr: 3e-4
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  max_grad_norm: 1.0
+
+  # LR schedule
+  lr_schedule: cosine
+  warmup_fraction: 0.05  # 5% of total steps (~19 steps)
+  min_warmup_steps: 10   # Guardrail
+  min_lr_ratio: 0.1      # Floor at 10% of base LR
+  min_floor_steps: 20    # Guardrail: minimum steps at LR floor
+
+  # Validation
+  val_every_steps: 22    # ~1 epoch
+
+  # Loss milestone tracking (for analysis, not termination)
+  loss_milestones:
+    enabled: true
+    mode: relative  # Fractional reduction from baseline
+    relative_fractions: [0.2, 0.4, 0.6, 0.8]
+
+scalars:
+  enabled: true
+  global_loss: true
+  per_task_loss: true
+  per_task_accuracy: true
+  grad_norm_global: true
+  grad_norm_per_block: false
+  lr: true
+
+checkpoints:
+  enabled: true
+  early_until_step: 50       # First ~2 epochs more frequent
+  early_every_steps: 5       # Every 5 steps in early phase
+  late_every_steps: 5        # Uniform throughout (same cadence)
+  keep_last_n: 10
+  save_optimizer: true
+
+probes:
+  fixed:
+    enabled: true
+    n_examples: 16
+    seed: 123
+  extended:
+    enabled: true
+    n_examples: 32
+    seed: 456
+    # Fractions of total_steps (scales with step_multiplier)
+    milestone_fractions: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+  metrics:
+    embeddings_output: true
+    residual_stream: true
+    attention_stats: true
+    entropy: true
+    top_k_mass: true
+    top_k_values: [1, 5, 10]
+  layers: [0, 4, 8, 12, 16, 20, 23]
+  fixed_every_steps: 5  # Every 5 steps
+
+activations:
+  enabled: true
+  # Fraction-based phases scale with step_multiplier
+  early_until_fraction: 1.0  # All steps use early cadence (uniform capture)
+  early_every_steps: 5       # Every 5 steps
+  mid_every_steps: 5         # (not used when early_until_fraction=1.0)
+  late_every_steps: 5        # (not used when early_until_fraction=1.0)
+  capture:
+    x_in: true
+    attn_out: true
+    x_mid: true
+    mlp_out: true
+    x_out: true
+  source: probe_fixed
+  probe_n_examples: 16
+  probe_seed: 123
+
+attention_matrices:
+  enabled: false

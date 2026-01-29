@@ -366,6 +366,13 @@ class CurriculumSampler:
                 return phase
         return None
 
+    def _get_current_phase_idx(self) -> int:
+        """Get the index of the current phase (0-indexed, -1 if no phase)."""
+        for idx, phase in enumerate(self.resolved_phases):
+            if phase.start_step <= self._current_step < phase.end_step:
+                return idx
+        return -1
+
     def _get_current_weights(self, phase: ResolvedPhase) -> Dict[str, float]:
         """Get weights for current step, handling ramp interpolation."""
         # Find the original phase definition for ramp handling
@@ -459,21 +466,51 @@ class CurriculumSampler:
 
 
 class SampleTraceWriter:
-    """Writes sample trace for deterministic replay.
+    """Writes sample trace for deterministic replay and attribution analysis.
 
-    Records which items were sampled at each step, enabling exact
-    reproduction of training even if the underlying pool changes.
+    Records which items were sampled at each step, enabling:
+    - Exact reproduction of training
+    - Attribution analysis (which items preceded events)
+    - Counterfactual experiments (replace items within family)
+
+    Schema v2 fields:
+    - step: optimizer step number
+    - micro: microbatch index within step (0 to accumulation_steps-1)
+    - pos: position within microbatch (0 to batch_size-1)
+    - phase: curriculum phase name
+    - phase_idx: curriculum phase index (stable across name changes)
+    - family_id: problem family
+    - item_id: unique item identifier
+    - split: dataset split (train/val_random/val_family)
+    - sampler_mode: sampling mode (balanced_family/proportional_family/uniform_item)
     """
 
-    def __init__(self, output_path: Path):
+    def __init__(
+        self,
+        output_path: Path,
+        run_id: str,
+        seed: int,
+        split: str = "train",
+        sampler_mode: str = "balanced_family",
+    ):
         """Initialize trace writer.
 
         Args:
             output_path: Path to output file (JSONL format)
+            run_id: Run identifier for provenance
+            seed: Random seed for provenance
+            split: Dataset split name
+            sampler_mode: Sampling mode name
         """
         self.output_path = output_path
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         self._file = None
+
+        # Provenance fields (written to meta file)
+        self.run_id = run_id
+        self.seed = seed
+        self.split = split
+        self.sampler_mode = sampler_mode
 
     def __enter__(self) -> "SampleTraceWriter":
         self._file = self.output_path.open("w")
@@ -484,36 +521,50 @@ class SampleTraceWriter:
             self._file.close()
             self._file = None
 
+        # Write companion meta file with provenance
+        meta_path = self.output_path.with_suffix(".meta.json")
+        meta = {
+            "schema_version": 2,
+            "run_id": self.run_id,
+            "seed": self.seed,
+            "split": self.split,
+            "sampler_mode": self.sampler_mode,
+            "trace_file": self.output_path.name,
+        }
+        meta_path.write_text(json.dumps(meta, indent=2))
+
     def write_batch(
         self,
         step: int,
+        micro: int,
         phase_name: str,
+        phase_idx: int,
         family_ids: List[str],
         item_ids: List[str],
-        content_hashes: Optional[List[str]] = None,
     ) -> None:
-        """Record a sampled batch.
+        """Record a sampled microbatch.
 
         Args:
-            step: Training step
-            phase_name: Current phase name
+            step: Optimizer step number
+            micro: Microbatch index within step (0 to accumulation_steps-1)
+            phase_name: Current curriculum phase name
+            phase_idx: Current curriculum phase index
             family_ids: Family IDs for each item in batch
             item_ids: Item IDs for each item in batch
-            content_hashes: Optional content hashes for verification
         """
         if not self._file:
             return
 
-        for i, (family_id, item_id) in enumerate(zip(family_ids, item_ids, strict=True)):
+        for pos, (family_id, item_id) in enumerate(zip(family_ids, item_ids, strict=True)):
             record = {
                 "step": step,
+                "micro": micro,
+                "pos": pos,
                 "phase": phase_name,
+                "phase_idx": phase_idx,
                 "family_id": family_id,
                 "item_id": item_id,
             }
-            if content_hashes and i < len(content_hashes):
-                record["content_sha256"] = content_hashes[i]
-
             self._file.write(json.dumps(record, separators=(",", ":")) + "\n")
 
 

@@ -46,7 +46,12 @@ from .config import (
     get_research_default_config,
     load_research_config,
 )
-from .curriculum import CurriculumSampler, CurriculumSpec, write_curriculum_manifest
+from .curriculum import (
+    CurriculumSampler,
+    CurriculumSpec,
+    SampleTraceWriter,
+    write_curriculum_manifest,
+)
 from .data import FamilyDataset, SplitDataset, get_tokenizer
 
 # --- Checkpoint staging infrastructure ---
@@ -186,15 +191,60 @@ def _should_checkpoint(step: int, cfg: ResearchCfg) -> bool:
     return step % cfg.checkpoints.late_every_steps == 0
 
 
-def _should_capture_activations(step: int, cfg: ResearchCfg) -> bool:
+def _resolve_activation_phases(cfg: ResearchCfg, total_steps: int) -> Dict[str, int]:
+    """Resolve activation phase boundaries, using fractions if specified.
+
+    Fractions take precedence over absolute steps and scale with step_multiplier.
+    """
+    act = cfg.activations
+
+    # Early phase boundary
+    if act.early_until_fraction is not None:
+        early_until = int(act.early_until_fraction * total_steps)
+    else:
+        early_until = act.early_until_step
+
+    # Mid phase boundary
+    if act.mid_until_fraction is not None:
+        mid_until = int(act.mid_until_fraction * total_steps)
+    else:
+        mid_until = act.mid_until_step
+
+    return {
+        "early_until": early_until,
+        "mid_until": mid_until,
+        "early_every": act.early_every_steps,
+        "mid_every": act.mid_every_steps,
+        "late_every": act.late_every_steps,
+    }
+
+
+def _should_capture_activations(
+    step: int, cfg: ResearchCfg, resolved_phases: Optional[Dict[str, int]] = None
+) -> bool:
     """Determine if we should capture activations at this step."""
     if not cfg.activations.enabled:
         return False
-    if step < cfg.activations.early_until_step:
-        return step % cfg.activations.early_every_steps == 0
-    if step < cfg.activations.mid_until_step:
-        return step % cfg.activations.mid_every_steps == 0
-    return step % cfg.activations.late_every_steps == 0
+
+    # Use resolved phases if provided, otherwise fall back to config values
+    if resolved_phases:
+        early_until = resolved_phases["early_until"]
+        mid_until = resolved_phases["mid_until"]
+        early_every = resolved_phases["early_every"]
+        mid_every = resolved_phases["mid_every"]
+        late_every = resolved_phases["late_every"]
+    else:
+        early_until = cfg.activations.early_until_step
+        mid_until = cfg.activations.mid_until_step
+        early_every = cfg.activations.early_every_steps
+        mid_every = cfg.activations.mid_every_steps
+        late_every = cfg.activations.late_every_steps
+
+    if step < early_until:
+        return step % early_every == 0
+    if step < mid_until:
+        return step % mid_every == 0
+    return step % late_every == 0
 
 
 def _get_milestone_steps(cfg: ResearchCfg) -> List[int]:
@@ -493,6 +543,8 @@ def run_research(
     config_path: Optional[str] = None,
     cfg: Optional[ResearchCfg] = None,
     seed_override: Optional[int] = None,
+    step_multiplier_override: Optional[float] = None,
+    quiet: bool = False,
 ) -> str:
     """Run research-grade training with comprehensive logging.
 
@@ -500,6 +552,8 @@ def run_research(
         config_path: Path to YAML config file
         cfg: Pre-loaded config (alternative to config_path)
         seed_override: Override seed from config (useful for running same config with different seeds)
+        step_multiplier_override: Override step_multiplier (for extension ladder experiments)
+        quiet: Suppress verbose output (checkpoint saves, epoch validation prints)
     """
     from dataclasses import replace
 
@@ -512,6 +566,11 @@ def run_research(
     if seed_override is not None:
         cfg = replace(cfg, seed=seed_override)
         print(f"Seed overridden to: {seed_override}")
+
+    # Apply step_multiplier override if provided
+    if step_multiplier_override is not None:
+        cfg = replace(cfg, training=replace(cfg.training, step_multiplier=step_multiplier_override))
+        print(f"Step multiplier overridden to: {step_multiplier_override}")
 
     set_seed(cfg.seed)
 
@@ -586,39 +645,60 @@ def run_research(
         )
         print("Using dummy dataset (no split_dir or family_data_dir specified)")
 
-    # Compute total_steps (epochs take precedence over steps if set)
+    # Compute total_steps with precedence: total_steps > epochs > steps (fallback)
     effective_batch_size = cfg.training.batch_size * cfg.training.gradient_accumulation_steps
     steps_per_epoch = max(1, len(dataset) // effective_batch_size)
 
-    if cfg.training.epochs is not None:
-        total_steps = cfg.training.epochs * steps_per_epoch
-        print(
-            f"Training for {cfg.training.epochs} epochs = {total_steps} steps ({steps_per_epoch} steps/epoch)"
-        )
+    # Step budget resolution
+    if cfg.training.total_steps is not None:
+        # PRIMARY: explicit total_steps
+        base_steps = cfg.training.total_steps
+        budget_source = "total_steps"
+    elif cfg.training.epochs is not None:
+        # Convenience: epochs converted to steps
+        base_steps = cfg.training.epochs * steps_per_epoch
+        budget_source = f"{cfg.training.epochs} epochs"
     else:
-        total_steps = cfg.training.steps
-        n_epochs = total_steps / steps_per_epoch if steps_per_epoch > 0 else 0
-        print(
-            f"Training for {total_steps} steps = {n_epochs:.1f} epochs ({steps_per_epoch} steps/epoch)"
-        )
+        # Fallback: legacy steps field
+        base_steps = cfg.training.steps
+        budget_source = "steps (fallback)"
 
-    # Compute warmup_steps (fraction takes precedence)
+    # Apply step_multiplier for extension ladder
+    total_steps = int(base_steps * cfg.training.step_multiplier)
+    n_epochs = total_steps / steps_per_epoch if steps_per_epoch > 0 else 0
+
+    print(f"Step budget: {base_steps} ({budget_source}) × {cfg.training.step_multiplier} = {total_steps} steps")
+    print(f"  = {n_epochs:.2f} epochs ({steps_per_epoch} steps/epoch)")
+
+    # Compute warmup_steps with guardrail (fraction takes precedence)
     if cfg.training.warmup_fraction is not None:
         warmup_steps = int(cfg.training.warmup_fraction * total_steps)
     else:
         warmup_steps = cfg.training.warmup_steps
-    warmup_steps = max(1, warmup_steps)  # At least 1 step
+    # Apply minimum warmup guardrail
+    warmup_steps = max(cfg.training.min_warmup_steps, warmup_steps)
+
+    # Compute floor_steps (for cosine schedule)
+    floor_steps = cfg.training.min_floor_steps
+
+    # Guardrail: prevent impossible schedules where warmup + floor >= total
+    schedule_clamped = False
+    schedule_clamp_reason = None
+    if warmup_steps + floor_steps >= total_steps:
+        schedule_clamped = True
+        schedule_clamp_reason = "warmup+floor>=total"
+        # Shrink floor first (keep warmup intact for stable early training)
+        floor_steps = max(1, total_steps - warmup_steps - 1)
+        print(f"[WARN] Schedule clamped: {schedule_clamp_reason}, floor_steps reduced to {floor_steps}")
 
     # Compute phase boundaries for event analysis
     # Phases: warmup (0 -> warmup_end), high_lr (warmup_end -> decay_start), decay (decay_start -> floor_start), floor
     warmup_end_step = warmup_steps
     if cfg.training.lr_schedule == "cosine":
         # Cosine: decay starts after warmup, reaches floor near the end
-        # The "knee" is roughly where cosine drops to ~50% of range
         decay_start_step = warmup_steps
-        # Floor is where LR is within 5% of min_lr
-        # For cosine: this is around 90% of the way through
-        floor_start_step = warmup_steps + int(0.9 * (total_steps - warmup_steps))
+        # Floor phase: where LR is within ~5% of min_lr (roughly last 10% of schedule)
+        floor_start_step = total_steps - floor_steps
     else:
         # Constant: no decay phase
         decay_start_step = total_steps
@@ -662,11 +742,34 @@ def run_research(
 
     if cfg.curriculum.enabled and cfg.curriculum.spec_path:
         spec_path = Path(cfg.curriculum.spec_path)
+        candidates = [spec_path]  # Track what we searched
+
         if not spec_path.is_absolute():
-            # Look for curriculum specs relative to config file or cwd
-            spec_path = Path(cfg.curriculum.spec_path)
+            # Try to resolve relative paths in order of priority
+            candidates = []
+
+            # 1. Relative to config file directory
+            if config_path:
+                config_dir = Path(config_path).resolve().parent
+                candidates.append(config_dir / cfg.curriculum.spec_path)
+
+            # 2. Relative to squiggle-experiments package root
+            package_root = Path(__file__).resolve().parent.parent.parent.parent
+            candidates.append(package_root / cfg.curriculum.spec_path)
+
+            # 3. Relative to current working directory
+            candidates.append(Path(cfg.curriculum.spec_path))
+
+            # Find first existing path
+            for candidate in candidates:
+                if candidate.exists():
+                    spec_path = candidate
+                    break
+
         if not spec_path.exists():
-            print(f"Warning: Curriculum spec not found: {spec_path}, falling back to shuffle")
+            print(f"Warning: Curriculum spec not found: {spec_path}")
+            print(f"  Searched: {[str(c) for c in candidates]}")
+            print("  Falling back to shuffle")
         else:
             curriculum_spec = CurriculumSpec.from_yaml(spec_path)
             family_index = dataset.build_family_index()
@@ -680,6 +783,20 @@ def run_research(
             print(
                 f"Curriculum enabled: {curriculum_spec.name} ({len(curriculum_spec.phases)} phases)"
             )
+
+    # Setup trace writer if enabled (for attribution analysis)
+    trace_writer: Optional[SampleTraceWriter] = None
+    if cfg.curriculum.trace_enabled and curriculum_sampler is not None:
+        trace_path = paths.run_dir(run_id) / "sample_trace.jsonl"
+        trace_writer = SampleTraceWriter(
+            output_path=trace_path,
+            run_id=run_id,
+            seed=cfg.seed,
+            split="train",
+            sampler_mode=curriculum_spec.default_sampling_mode if curriculum_spec else "unknown",
+        )
+        trace_writer.__enter__()
+        print(f"Trace enabled: {trace_path}")
 
     # Note: when using curriculum sampler, we sample batches manually in the loop
     # So we create DataLoader with shuffle for fallback, but use sampler directly when available
@@ -712,26 +829,66 @@ def run_research(
 
     milestone_steps = _get_milestone_steps(cfg)
 
+    # Resolve activation capture phases (handles fraction-based boundaries)
+    activation_phases = _resolve_activation_phases(cfg, total_steps)
+    if cfg.activations.enabled:
+        print(f"Activation capture: early<{activation_phases['early_until']}, "
+              f"mid<{activation_phases['mid_until']}, late>={activation_phases['mid_until']}")
+
     # Write meta.json
     meta_path = paths.run_dir(run_id) / "meta.json"
+
+    # Track step multiplier sources for auditability
+    step_multiplier_config = cfg.training.step_multiplier
+    step_multiplier_requested = step_multiplier_override  # From CLI, may be None
+    step_multiplier_effective = cfg.training.step_multiplier  # After any override applied
+
     write_meta_json(
         meta_path,
         {
             "run_id": run_id,
             "run_name": cfg.run_name,
             "seed": cfg.seed,
-            "steps": total_steps,
-            "epochs": cfg.training.epochs,
-            "steps_per_epoch": steps_per_epoch,
-            "batch_size": cfg.training.batch_size,
-            "gradient_accumulation_steps": cfg.training.gradient_accumulation_steps,
-            "effective_batch_size": effective_batch_size,
-            "lr": cfg.training.lr,
-            "lr_schedule": cfg.training.lr_schedule,
-            "warmup_steps": warmup_steps,
-            "warmup_fraction": cfg.training.warmup_fraction,
-            "min_lr_ratio": cfg.training.min_lr_ratio,
+            # Config file info
+            "config_path": str(Path(config_path).resolve()) if config_path else None,
+            "config_filename": Path(config_path).name if config_path else None,
+            # Step budget - canonical fields
+            "training": {
+                "total_steps_base": base_steps,
+                "step_multiplier_config": step_multiplier_config,
+                "step_multiplier_requested": step_multiplier_requested,
+                "step_multiplier_effective": step_multiplier_effective,
+                "total_steps_effective": total_steps,
+                "step_budget_source": budget_source,
+                "steps_per_epoch": steps_per_epoch,
+                "epochs_effective": n_epochs,
+                # Schedule
+                "warmup_steps": warmup_steps,
+                "warmup_fraction": cfg.training.warmup_fraction,
+                "min_warmup_steps": cfg.training.min_warmup_steps,
+                "floor_steps": floor_steps,
+                "min_floor_steps": cfg.training.min_floor_steps,
+                "schedule_clamped": schedule_clamped,
+                "schedule_clamp_reason": schedule_clamp_reason,
+                # Optimizer
+                "lr": cfg.training.lr,
+                "lr_schedule": cfg.training.lr_schedule,
+                "min_lr_ratio": cfg.training.min_lr_ratio,
+                "batch_size": cfg.training.batch_size,
+                "gradient_accumulation_steps": cfg.training.gradient_accumulation_steps,
+                "effective_batch_size": effective_batch_size,
+            },
             "phase_boundaries": phase_boundaries,
+            "loss_milestones_config": {
+                "enabled": cfg.training.loss_milestones.enabled,
+                "mode": cfg.training.loss_milestones.mode,
+                "relative_fractions": list(cfg.training.loss_milestones.relative_fractions)
+                if cfg.training.loss_milestones.mode == "relative"
+                else None,
+                "absolute_values": list(cfg.training.loss_milestones.absolute_values)
+                if cfg.training.loss_milestones.absolute_values
+                else None,
+            },
             "device": device,
             "model": {
                 "size": cfg.model.size,
@@ -756,8 +913,21 @@ def run_research(
                 "spec_name": curriculum_spec.name if curriculum_spec else None,
                 "spec_hash": curriculum_spec.yaml_hash[:16] if curriculum_spec else None,
                 "phases": len(curriculum_spec.phases) if curriculum_spec else 0,
+                "trace_enabled": trace_writer is not None,
+                "trace_path": "sample_trace.jsonl" if trace_writer else None,
             },
-            "config_path": str(Path(config_path).resolve()) if config_path else None,
+            "activations": {
+                "enabled": cfg.activations.enabled,
+                "early_until_step_config": cfg.activations.early_until_step,
+                "early_until_fraction_config": cfg.activations.early_until_fraction,
+                "mid_until_step_config": cfg.activations.mid_until_step,
+                "mid_until_fraction_config": cfg.activations.mid_until_fraction,
+                "early_until_resolved": activation_phases["early_until"],
+                "mid_until_resolved": activation_phases["mid_until"],
+                "early_every_steps": activation_phases["early_every"],
+                "mid_every_steps": activation_phases["mid_every"],
+                "late_every_steps": activation_phases["late_every"],
+            },
         },
     )
 
@@ -788,13 +958,41 @@ def run_research(
     epoch_start_loss: Optional[float] = None
     epoch_losses: Dict[int, Dict[str, float]] = {}  # epoch -> {start, end, delta}
 
+    # Loss milestone tracking (for analysis, not termination)
+    # Stable definition: milestone at p means loss <= baseline * (1 - p)
+    # Baseline computed from first K steps after warmup for stability
+    best_loss: Optional[float] = None
+    loss_milestones_achieved: List[Dict] = []  # List of milestone records
+    milestone_targets_remaining: List[float] = []  # Milestones not yet achieved
+
+    # Baseline tracking for relative milestones
+    baseline_steps_k = 10  # Number of steps to average for baseline
+    baseline_losses: List[float] = []  # Collect losses for baseline computation
+    baseline_loss: Optional[float] = None  # Computed baseline
+    milestone_absolute_thresholds: Dict[float, float] = {}  # p -> absolute loss threshold
+
+    # EMA smoothing for current loss (alpha=0.1 for stability)
+    loss_ema: Optional[float] = None
+    loss_ema_alpha = 0.1
+
+    if cfg.training.loss_milestones.enabled:
+        if cfg.training.loss_milestones.mode == "relative":
+            # Will compute thresholds once baseline is established
+            milestone_targets_remaining = sorted(
+                cfg.training.loss_milestones.relative_fractions
+            )  # Start from smallest (easiest)
+        elif cfg.training.loss_milestones.absolute_values:
+            milestone_targets_remaining = sorted(
+                cfg.training.loss_milestones.absolute_values, reverse=True
+            )  # Start from highest (easiest)
+
     for step in pbar:
         # Update curriculum sampler step if enabled
         if curriculum_sampler is not None:
             curriculum_sampler.set_step(step)
 
         # Gradient accumulation loop
-        for _ in range(cfg.training.gradient_accumulation_steps):
+        for accum_idx in range(cfg.training.gradient_accumulation_steps):
             if curriculum_sampler is not None:
                 # Use curriculum sampler to get batch indices
                 batch_indices = curriculum_sampler.sample_batch()
@@ -802,6 +1000,28 @@ def run_research(
                 batch_items = [dataset[idx] for idx in batch_indices]
                 input_ids = torch.stack([item["input_ids"] for item in batch_items]).to(device)
                 labels = torch.stack([item["labels"] for item in batch_items]).to(device)
+
+                # Write trace if enabled (log ALL microbatches for complete attribution)
+                if trace_writer is not None:
+                    # Get family and item IDs for trace
+                    family_ids = [dataset.family_ids[idx] for idx in batch_indices]
+                    # Use raw item's id field if available, otherwise use index
+                    item_ids = []
+                    for idx in batch_indices:
+                        raw_item = dataset.items[idx]
+                        item_id = raw_item.get("id") or raw_item.get("item_id") or str(idx)
+                        item_ids.append(item_id)
+                    current_phase = curriculum_sampler._get_current_phase()
+                    phase_name = current_phase.name if current_phase else "unknown"
+                    phase_idx = curriculum_sampler._get_current_phase_idx()
+                    trace_writer.write_batch(
+                        step=step,
+                        micro=accum_idx,
+                        phase_name=phase_name,
+                        phase_idx=phase_idx,
+                        family_ids=family_ids,
+                        item_ids=item_ids,
+                    )
             else:
                 # Standard dataloader iteration
                 try:
@@ -842,6 +1062,66 @@ def run_research(
             start_loss = avg_loss
         if epoch_start_loss is None:
             epoch_start_loss = avg_loss
+
+        # Track best loss
+        if best_loss is None or avg_loss < best_loss:
+            best_loss = avg_loss
+
+        # Update loss EMA for smoothed milestone checking
+        if loss_ema is None:
+            loss_ema = avg_loss
+        else:
+            loss_ema = loss_ema_alpha * avg_loss + (1 - loss_ema_alpha) * loss_ema
+
+        # Loss milestone tracking
+        if cfg.training.loss_milestones.enabled:
+            # Collect baseline losses (first K steps after warmup)
+            if baseline_loss is None and step >= warmup_steps:
+                baseline_losses.append(avg_loss)
+                if len(baseline_losses) >= baseline_steps_k:
+                    baseline_loss = sum(baseline_losses) / len(baseline_losses)
+                    # Compute absolute thresholds for relative milestones
+                    if cfg.training.loss_milestones.mode == "relative":
+                        for p in milestone_targets_remaining:
+                            # milestone at p means loss <= baseline * (1 - p)
+                            milestone_absolute_thresholds[p] = baseline_loss * (1 - p)
+                        print(f"\n[Milestones] Baseline loss: {baseline_loss:.4f} (from steps {warmup_steps}-{step})")
+                        print(f"[Milestones] Thresholds: {', '.join(f'{p*100:.0f}%={t:.4f}' for p, t in sorted(milestone_absolute_thresholds.items()))}")
+
+            # Check milestones once baseline is established
+            if baseline_loss is not None and milestone_targets_remaining:
+                if cfg.training.loss_milestones.mode == "relative":
+                    # Check each milestone using smoothed loss
+                    for milestone_frac in list(milestone_targets_remaining):
+                        target_loss = milestone_absolute_thresholds[milestone_frac]
+                        if loss_ema <= target_loss:
+                            loss_milestones_achieved.append({
+                                "step": step,
+                                "loss_raw": avg_loss,
+                                "loss_smooth": loss_ema,
+                                "milestone_value": milestone_frac,
+                                "milestone_type": "relative",
+                                "target_loss": target_loss,
+                                "baseline_loss": baseline_loss,
+                                "lr": current_lr,
+                                "epoch_float": step / steps_per_epoch if steps_per_epoch > 0 else 0,
+                            })
+                            milestone_targets_remaining.remove(milestone_frac)
+                else:
+                    # Absolute mode: check if we've crossed each absolute threshold
+                    for target_loss in list(milestone_targets_remaining):
+                        if loss_ema <= target_loss:
+                            loss_milestones_achieved.append({
+                                "step": step,
+                                "loss_raw": avg_loss,
+                                "loss_smooth": loss_ema,
+                                "milestone_value": target_loss,
+                                "milestone_type": "absolute",
+                                "target_loss": target_loss,
+                                "lr": current_lr,
+                                "epoch_float": step / steps_per_epoch if steps_per_epoch > 0 else 0,
+                            })
+                            milestone_targets_remaining.remove(target_loss)
 
         # Track epoch boundary (start of new epoch)
         current_epoch = step // steps_per_epoch if steps_per_epoch > 0 else 0
@@ -934,13 +1214,14 @@ def run_research(
                 delta = epoch_losses[current_epoch]["delta"]
                 epoch_delta_str = f", delta={delta:.4f}"
 
-            print(
-                f"\n[Epoch {current_epoch + 1}] Val-random: loss={val_metrics['val_loss']:.4f}, acc={val_metrics['val_accuracy']:.4f}{epoch_delta_str}"
-            )
-            if val_family_dataset is not None:
+            if not quiet:
                 print(
-                    f"           Val-family: loss={val_family_metrics['val_loss']:.4f}, acc={val_family_metrics['val_accuracy']:.4f}"
+                    f"\n[Epoch {current_epoch + 1}] Val-random: loss={val_metrics['val_loss']:.4f}, acc={val_metrics['val_accuracy']:.4f}{epoch_delta_str}"
                 )
+                if val_family_dataset is not None:
+                    print(
+                        f"           Val-family: loss={val_family_metrics['val_loss']:.4f}, acc={val_family_metrics['val_accuracy']:.4f}"
+                    )
             model.train()
 
         scalar_rows.append(row)
@@ -955,10 +1236,11 @@ def run_research(
         # Checkpointing
         if _should_checkpoint(step, cfg):
             ckpt_path = _save_checkpoint(model, optimizer, scheduler, step, run_id, cfg)
-            print(f"\n[Checkpoint] Saved: {ckpt_path}")
+            if not quiet:
+                print(f"\n[Checkpoint] Saved: {ckpt_path}")
 
-        # Activation capture
-        if _should_capture_activations(step, cfg):
+        # Activation capture (uses resolved phase boundaries)
+        if _should_capture_activations(step, cfg, activation_phases):
             capture_input = (
                 probe_fixed[: cfg.activations.probe_n_examples]
                 if probe_fixed is not None
@@ -985,15 +1267,59 @@ def run_research(
     scalar_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(scalar_path, index=False)
 
+    # Write loss milestones if any were achieved
+    milestones_path = None
+    if loss_milestones_achieved:
+        milestones_df = pd.DataFrame(loss_milestones_achieved)
+        milestones_df["run_id"] = run_id
+        milestones_df["seed"] = cfg.seed
+        # Reorder columns for clarity
+        col_order = ["run_id", "seed", "step", "epoch_float", "milestone_value", "milestone_type",
+                     "loss_raw", "loss_smooth", "target_loss", "baseline_loss", "lr"]
+        milestones_df = milestones_df[[c for c in col_order if c in milestones_df.columns]]
+        milestones_path = paths.run_dir(run_id) / "milestones.parquet"
+        milestones_df.to_parquet(milestones_path, index=False)
+
+    # Update meta.json with milestone summary
+    meta_data = json.loads(meta_path.read_text())
+    meta_data["loss_milestones_summary"] = {
+        "achieved_count": len(loss_milestones_achieved),
+        "milestones": loss_milestones_achieved,
+        # Baseline tracking
+        "baseline_loss": baseline_loss,
+        "baseline_steps_used": baseline_steps_k,
+        "baseline_warmup_offset": warmup_steps,
+        "smoothing": {"method": "ema", "alpha": loss_ema_alpha},
+        # Absolute thresholds (computed from baseline, useful for comparison)
+        "thresholds_absolute": milestone_absolute_thresholds if baseline_loss else None,
+        # Raw loss stats
+        "start_loss": start_loss,
+        "best_loss": best_loss,
+        "final_loss": avg_loss,
+        "final_loss_smooth": loss_ema,
+    }
+    meta_path.write_text(json.dumps(meta_data, indent=2))
+
     # Loss delta summary
     end_loss = avg_loss
     total_delta = (start_loss - end_loss) if start_loss is not None else 0.0
 
     print(f"\n[✓] Research run complete: {run_id}")
     print("\n--- Loss Summary ---")
-    print(f"Start loss:  {start_loss:.4f}" if start_loss else "Start loss:  N/A")
-    print(f"End loss:    {end_loss:.4f}")
-    print(f"Total delta: {total_delta:.4f}")
+    print(f"Start loss:    {start_loss:.4f}" if start_loss else "Start loss:    N/A")
+    print(f"Baseline loss: {baseline_loss:.4f}" if baseline_loss else "Baseline loss: N/A")
+    print(f"Best loss:     {best_loss:.4f}" if best_loss else "Best loss:     N/A")
+    print(f"End loss:      {end_loss:.4f} (smooth: {loss_ema:.4f})" if loss_ema else f"End loss:      {end_loss:.4f}")
+    print(f"Total delta:   {total_delta:.4f}")
+
+    if loss_milestones_achieved:
+        print("\n--- Loss Milestones (fractional reduction from baseline) ---")
+        for m in loss_milestones_achieved:
+            if m["milestone_type"] == "relative":
+                pct = m['milestone_value'] * 100
+                print(f"  {pct:.0f}% reduction at step {m['step']} (smooth={m['loss_smooth']:.4f}, target={m['target_loss']:.4f})")
+            else:
+                print(f"  Loss {m['milestone_value']:.4f} at step {m['step']} (smooth={m['loss_smooth']:.4f})")
     if epoch_losses:
         print("\nPer-epoch deltas:")
         for epoch_num in sorted(epoch_losses.keys()):
@@ -1013,8 +1339,15 @@ def run_research(
                     print("  [WARN] Epoch 1 delta smaller than later epochs - check LR")
     print(f"    Meta: {meta_path}")
     print(f"    Scalars: {scalar_path}")
+    if milestones_path:
+        print(f"    Milestones: {milestones_path}")
     print(f"    Checkpoints: {paths.run_dir(run_id) / 'checkpoints'}")
     print(f"    Captures: {paths.captures_dir(run_id)}")
+
+    # Close trace writer if enabled
+    if trace_writer is not None:
+        trace_writer.__exit__(None, None, None)
+        print(f"    Trace: {paths.run_dir(run_id) / 'sample_trace.jsonl'}")
 
     # Wait for any pending checkpoint moves to complete and cleanup staging
     if _checkpoint_move_executor is not None:
@@ -1035,6 +1368,11 @@ def main() -> None:
         choices=["debug", "default"],
         help="Use a preset config instead of YAML file",
     )
+    parser.add_argument(
+        "--quiet", "-q",
+        action="store_true",
+        help="Suppress verbose output (checkpoint saves, epoch validation)",
+    )
     args = parser.parse_args()
 
     if args.preset:
@@ -1042,9 +1380,9 @@ def main() -> None:
             cfg = get_research_debug_config()
         else:
             cfg = get_research_default_config()
-        run_research(cfg=cfg)
+        run_research(cfg=cfg, quiet=args.quiet)
     elif args.config:
-        run_research(config_path=args.config)
+        run_research(config_path=args.config, quiet=args.quiet)
     else:
         parser.error("Must specify either --config or --preset")
 

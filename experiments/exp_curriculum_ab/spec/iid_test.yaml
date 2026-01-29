@@ -1,8 +1,10 @@
-# Test Suite A: 3 epochs, cosine schedule, seed 42
-# Baseline configuration for seed invariance testing
+# IID Baseline Test Config for Curriculum A/B Experiment
+#
+# Proportional sampling with no curriculum structure.
+# Inherits all training settings from base research config.
 
-run_name: "test_suite_a_3ep_fixed_lr"
-seed: 42
+run_name: "exp_curriculum_ab_iid"
+seed: 42  # Override with --seed
 device: "cuda:0"
 
 model:
@@ -13,18 +15,31 @@ model:
 data:
   split_dir: "/home/todd/software/squiggle/data/candidate_pool/splits/split_v1_s42"
 
+# Curriculum-driven training
+curriculum:
+  enabled: true
+  spec_path: "curricula/iid_baseline.yaml"
+  trace_enabled: true  # Required for attribution
+  log_distribution_every: 100
+
 training:
-  epochs: 3
+  total_steps: 374
   batch_size: 2
-  gradient_accumulation_steps: 32  # effective batch = 64
+  gradient_accumulation_steps: 32
   lr: 3e-4
   weight_decay: 0.1
   betas: [0.9, 0.95]
-  warmup_fraction: 0.05  # 5% of total steps
-  lr_schedule: constant
-  min_lr_ratio: 0.1
   max_grad_norm: 1.0
-  val_every_epoch: true
+  lr_schedule: cosine
+  warmup_fraction: 0.05
+  min_warmup_steps: 10
+  min_lr_ratio: 0.1
+  min_floor_steps: 20
+  val_every_steps: 22
+  loss_milestones:
+    enabled: true
+    mode: relative
+    relative_fractions: [0.2, 0.4, 0.6, 0.8]
 
 scalars:
   enabled: true
@@ -38,9 +53,9 @@ scalars:
 checkpoints:
   enabled: true
   early_until_step: 50
-  early_every_steps: 10
-  late_every_steps: 20
-  keep_last_n: 5
+  early_every_steps: 5
+  late_every_steps: 5
+  keep_last_n: 10
   save_optimizer: true
 
 probes:
@@ -52,7 +67,7 @@ probes:
     enabled: true
     n_examples: 32
     seed: 456
-    milestone_fractions: [0.1, 0.25, 0.5, 0.75, 1.0]
+    milestone_fractions: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
   metrics:
     embeddings_output: true
     residual_stream: true
@@ -61,15 +76,14 @@ probes:
     top_k_mass: true
     top_k_values: [1, 5, 10]
   layers: [0, 4, 8, 12, 16, 20, 23]
-  fixed_every_steps: 10
+  fixed_every_steps: 5
 
 activations:
   enabled: true
-  early_until_step: 30
-  early_every_steps: 10
-  mid_until_step: 50
-  mid_every_steps: 15
-  late_every_steps: 20
+  early_until_fraction: 1.0
+  early_every_steps: 5
+  mid_every_steps: 5
+  late_every_steps: 5
   capture:
     x_in: true
     attn_out: true

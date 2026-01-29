@@ -1,0 +1,44 @@
+version: 1
+exp_id: exp_curriculum_ab
+
+hypothesis: >
+  Different curricula produce different event yields.
+  Blocked and ramp curricula yield more consensus events than iid/balanced baselines.
+
+isolates: curriculum_policy
+
+invariants:
+  - model_config (350m)
+  - total_steps (374)
+  - dataset (split_v1_s42)
+  - optimizer (AdamW, lr=3e-4)
+  - batch_size (64 effective)
+  - seed set (identical across arms)
+
+arms:
+  iid:
+    test_config: iid_test.yaml
+    description: Proportional sampling via iid_baseline.yaml curriculum
+
+  balanced:
+    test_config: balanced_test.yaml
+    description: Family-balanced sampling via balanced_baseline.yaml curriculum
+
+  blocked:
+    test_config: blocked_test.yaml
+    description: One target family at a time via family_blocked.yaml curriculum
+
+  ramp:
+    test_config: ramp_test.yaml
+    description: Targets-only → ramp controls via family_ramp.yaml curriculum
+
+seeds: [42, 123, 456]
+
+primary_outcomes:
+  - consensus_event_count
+  - event_yield_per_step
+  - mean_final_loss
+
+event_consensus_rules:
+  step_tolerance: 5
+  min_seed_fraction: 1.0

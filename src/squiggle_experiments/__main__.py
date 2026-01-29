@@ -24,6 +24,15 @@ def main():
     parser = argparse.ArgumentParser(description="Run squiggle training")
     parser.add_argument("--config", type=str, required=True, help="Path to config file")
     parser.add_argument("--seed", type=int, default=None, help="Override seed from config")
+    parser.add_argument(
+        "--step-multiplier", type=float, default=None,
+        help="Override step_multiplier for extension ladder (e.g., 2.0 for 2x training)",
+    )
+    parser.add_argument(
+        "--quiet", "-q",
+        action="store_true",
+        help="Suppress verbose output (checkpoint saves, epoch validation)",
+    )
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -35,7 +44,12 @@ def main():
         # Research trainer
         from squiggle_experiments.research.trainer import run_research
 
-        run_research(config_path=str(config_path), seed_override=args.seed)
+        run_research(
+            config_path=str(config_path),
+            seed_override=args.seed,
+            step_multiplier_override=args.step_multiplier,
+            quiet=args.quiet,
+        )
     else:
         # Scout trainer
         from squiggle_experiments.scout.run import run_scout

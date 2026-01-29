@@ -113,17 +113,27 @@ class ActivationCaptureCfg:
 
 @dataclass(frozen=True)
 class ActivationCheckpointCfg:
-    """Configuration for activation checkpoints."""
+    """Configuration for activation checkpoints.
+
+    Phase boundaries can be specified as either:
+    - Absolute steps (early_until_step, mid_until_step)
+    - Fractions of total_steps (early_until_fraction, mid_until_fraction)
+
+    Fractions take precedence if set, and scale with step_multiplier automatically.
+    Set early_until_fraction=1.0 for uniform capture across entire run.
+    """
 
     enabled: bool = True
     # All layers captured at these intervals:
-    # Early phase (steps 0-2000): every 500-1000 steps
+    # Early phase (steps 0-early_until): every early_every_steps
     early_until_step: int = 2000
+    early_until_fraction: Optional[float] = None  # If set, overrides early_until_step
     early_every_steps: int = 500
-    # Mid phase (steps 2000-10000): every 2000-5000 steps
+    # Mid phase (early_until-mid_until): every mid_every_steps
     mid_until_step: int = 10000
+    mid_until_fraction: Optional[float] = None  # If set, overrides mid_until_step
     mid_every_steps: int = 2000
-    # Late phase (steps 10000+): every 5000-10000 steps
+    # Late phase (mid_until+): every late_every_steps
     late_every_steps: int = 5000
     # What to capture
     capture: ActivationCaptureCfg = field(default_factory=ActivationCaptureCfg)
@@ -221,17 +231,51 @@ class CurriculumCfg:
 
 
 # -------------------------
+# Loss Milestones Config
+# -------------------------
+
+
+@dataclass(frozen=True)
+class LossMilestonesCfg:
+    """Configuration for loss milestone tracking.
+
+    Milestones are recorded for analysis but do NOT affect training termination.
+    Use relative mode for cross-curriculum comparability.
+    """
+
+    enabled: bool = True
+    # "relative" = % improvement from initial to best loss
+    # "absolute" = fixed loss values
+    mode: Literal["relative", "absolute"] = "relative"
+    # For relative mode: fractions of improvement (0.2 = 20% of the way from initial to best)
+    relative_fractions: tuple = (0.2, 0.4, 0.6, 0.8)
+    # For absolute mode: specific loss values to track
+    absolute_values: Optional[tuple] = None  # e.g., (4.0, 3.5, 3.0, 2.5)
+
+
+# -------------------------
 # Training config
 # -------------------------
 
 
 @dataclass(frozen=True)
 class TrainingCfg:
-    """Training hyperparameters."""
+    """Training hyperparameters.
 
-    # Basic - use epochs OR steps (epochs takes precedence if set)
-    steps: int = 50000
-    epochs: Optional[int] = None  # If set, overrides steps based on dataset size
+    Step budget resolution (in order of precedence):
+    1. total_steps (if set) - canonical, recommended
+    2. epochs (if set) - converted to steps based on dataset size
+    3. steps (fallback default)
+
+    The step_multiplier scales the resolved budget (useful for extension experiments).
+    """
+
+    # Step budget - total_steps is canonical (epochs/steps are legacy/convenience)
+    total_steps: Optional[int] = None  # PRIMARY: explicit step budget
+    epochs: Optional[int] = None  # Convenience: converted to steps from dataset size
+    steps: int = 50000  # Fallback default
+    step_multiplier: float = 1.0  # Extension multiplier (1.0, 2.0, 3.0 for ladder)
+
     batch_size: int = 32
     gradient_accumulation_steps: int = 4
     # Optimizer
@@ -241,8 +285,10 @@ class TrainingCfg:
     # LR schedule
     warmup_steps: int = 500  # Used if warmup_fraction is None
     warmup_fraction: Optional[float] = 0.05  # 5% of total steps (overrides warmup_steps)
+    min_warmup_steps: int = 10  # Guardrail: minimum warmup regardless of fraction
     lr_schedule: Literal["cosine", "linear", "constant"] = "cosine"
     min_lr_ratio: float = 0.1  # Floor for cosine decay (0.1 = 10% of base LR)
+    min_floor_steps: int = 50  # Guardrail: minimum steps at LR floor
     # Precision
     dtype: Literal["fp32", "fp16", "bf16"] = "bf16"
     # Gradient clipping
@@ -250,6 +296,9 @@ class TrainingCfg:
     # Validation
     val_every_epoch: bool = True  # Run validation every epoch (if epochs set)
     val_every_steps: Optional[int] = None  # Run validation every N steps (if step-based)
+
+    # Loss milestone tracking (for analysis, not termination)
+    loss_milestones: LossMilestonesCfg = field(default_factory=LossMilestonesCfg)
 
 
 # -------------------------
@@ -315,9 +364,23 @@ def _coerce_training(d: Dict[str, Any]) -> TrainingCfg:
     # Handle epochs (may be int or None)
     if "epochs" in dd and dd["epochs"] is not None:
         dd["epochs"] = int(dd["epochs"])
+    # Handle total_steps (may be int or None)
+    if "total_steps" in dd and dd["total_steps"] is not None:
+        dd["total_steps"] = int(dd["total_steps"])
     # Handle val_every_steps (may be int or None)
     if "val_every_steps" in dd and dd["val_every_steps"] is not None:
         dd["val_every_steps"] = int(dd["val_every_steps"])
+    # Handle step_multiplier
+    if "step_multiplier" in dd:
+        dd["step_multiplier"] = float(dd["step_multiplier"])
+    # Handle guardrails
+    if "min_warmup_steps" in dd:
+        dd["min_warmup_steps"] = int(dd["min_warmup_steps"])
+    if "min_floor_steps" in dd:
+        dd["min_floor_steps"] = int(dd["min_floor_steps"])
+    # Handle loss milestones sub-config
+    if "loss_milestones" in dd:
+        dd["loss_milestones"] = _coerce_loss_milestones(dd["loss_milestones"])
     return TrainingCfg(**dd)
 
 
@@ -379,6 +442,15 @@ def _coerce_attention_matrices(d: Dict[str, Any]) -> AttentionMatrixCfg:
 
 def _coerce_curriculum(d: Dict[str, Any]) -> CurriculumCfg:
     return CurriculumCfg(**(d or {}))
+
+
+def _coerce_loss_milestones(d: Dict[str, Any]) -> LossMilestonesCfg:
+    dd = dict(d or {})
+    if "relative_fractions" in dd:
+        dd["relative_fractions"] = tuple(dd["relative_fractions"])
+    if "absolute_values" in dd and dd["absolute_values"] is not None:
+        dd["absolute_values"] = tuple(dd["absolute_values"])
+    return LossMilestonesCfg(**dd)
 
 
 # -------------------------
