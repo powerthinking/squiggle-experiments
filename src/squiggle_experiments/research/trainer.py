@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from squiggle_core import paths
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -360,7 +361,8 @@ def _evaluate_validation(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=2,
+        pin_memory=True,
     )
 
     total_loss = 0.0
@@ -576,6 +578,10 @@ def run_research(
 
     device = _pick_device(cfg.device)
     print(f"Using device: {device}")
+
+    # Setup AMP dtype (computed early for meta.json)
+    use_amp = device.startswith("cuda") and cfg.training.dtype in ("fp16", "bf16")
+    amp_dtype = torch.float16 if cfg.training.dtype == "fp16" else torch.bfloat16
 
     # Generate run ID
     run_id = cfg.run_id if cfg.run_id else make_run_id(cfg.run_name, cfg.seed)
@@ -800,12 +806,16 @@ def run_research(
 
     # Note: when using curriculum sampler, we sample batches manually in the loop
     # So we create DataLoader with shuffle for fallback, but use sampler directly when available
+    # Use num_workers>0 for parallel data loading (significant speedup)
+    # Note: When using curriculum_sampler, we manually assemble batches so workers help less
+    num_workers = 2 if curriculum_sampler is None else 0
     dataloader = DataLoader(
         dataset,
         batch_size=cfg.training.batch_size,
         shuffle=(curriculum_sampler is None),  # Only shuffle when not using curriculum
-        num_workers=0,
+        num_workers=num_workers,
         pin_memory=True if device.startswith("cuda") else False,
+        persistent_workers=True if num_workers > 0 else False,
     )
     data_iter = iter(dataloader)
 
@@ -877,6 +887,10 @@ def run_research(
                 "batch_size": cfg.training.batch_size,
                 "gradient_accumulation_steps": cfg.training.gradient_accumulation_steps,
                 "effective_batch_size": effective_batch_size,
+                # Precision
+                "dtype": cfg.training.dtype,
+                "amp_enabled": use_amp,
+                "amp_dtype": str(amp_dtype) if use_amp else None,
             },
             "phase_boundaries": phase_boundaries,
             "loss_milestones_config": {
@@ -944,6 +958,14 @@ def run_research(
         manifest_path = paths.run_dir(run_id) / "curriculum_manifest.json"
         write_curriculum_manifest(manifest, manifest_path)
         print(f"Curriculum manifest written to {manifest_path}")
+
+    # Setup AMP GradScaler (only needed for fp16, not bf16)
+    scaler = GradScaler("cuda", enabled=(cfg.training.dtype == "fp16")) if use_amp else None
+
+    if use_amp:
+        print(f"AMP enabled: dtype={cfg.training.dtype}, scaler={'enabled' if scaler and scaler.is_enabled() else 'disabled'}")
+    else:
+        print(f"AMP disabled (device={device}, dtype={cfg.training.dtype})")
 
     # Training loop
     scalar_rows: List[Dict] = []
@@ -1033,13 +1055,28 @@ def run_research(
                 input_ids = batch["input_ids"].to(device)
                 labels = batch["labels"].to(device)
 
-            _, loss = model(input_ids, labels)
-            loss = loss / cfg.training.gradient_accumulation_steps
-            loss.backward()
+            # Forward pass with optional AMP
+            if use_amp:
+                with autocast("cuda", dtype=amp_dtype):
+                    _, loss = model(input_ids, labels)
+                    loss = loss / cfg.training.gradient_accumulation_steps
+            else:
+                _, loss = model(input_ids, labels)
+                loss = loss / cfg.training.gradient_accumulation_steps
+
+            # Backward pass with optional scaler
+            if scaler is not None and scaler.is_enabled():
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
             accumulated_loss += loss.item()
             accumulation_steps += 1
 
-        # Gradient clipping
+        # Gradient clipping (unscale first if using scaler)
+        if scaler is not None and scaler.is_enabled():
+            scaler.unscale_(optimizer)
+
         if cfg.training.max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.training.max_grad_norm)
 
@@ -1048,8 +1085,13 @@ def run_research(
         if cfg.scalars.grad_norm_global:
             grad_norms = _compute_grad_norms(model, cfg.scalars.grad_norm_per_block)
 
-        # Optimizer step
-        optimizer.step()
+        # Optimizer step with optional scaler
+        if scaler is not None and scaler.is_enabled():
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+
         scheduler.step()
         optimizer.zero_grad(set_to_none=True)
 

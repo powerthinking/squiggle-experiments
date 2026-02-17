@@ -76,14 +76,14 @@ probes:
     top_k_mass: true
     top_k_values: [1, 5, 10]
   layers: [0, 4, 8, 12, 16, 20, 23]
-  fixed_every_steps: 5
+  fixed_every_steps: 2  # ~187 captures over 374 steps
 
 activations:
   enabled: true
   early_until_fraction: 1.0
-  early_every_steps: 5
-  mid_every_steps: 5
-  late_every_steps: 5
+  early_every_steps: 2  # ~187 captures over 374 steps
+  mid_every_steps: 2
+  late_every_steps: 2
   capture:
     x_in: true
     attn_out: true

@@ -24,8 +24,8 @@ training:
   total_steps: 374
   # step_multiplier: 1.0  # Override via CLI: --step-multiplier 2.0
 
-  batch_size: 2
-  gradient_accumulation_steps: 32  # effective batch = 64
+  batch_size: 16
+  gradient_accumulation_steps: 4  # effective batch = 64
 
   # Optimizer
   lr: 3e-4
@@ -61,8 +61,8 @@ scalars:
 checkpoints:
   enabled: true
   early_until_step: 50       # First ~2 epochs more frequent
-  early_every_steps: 5       # Every 5 steps in early phase
-  late_every_steps: 5        # Uniform throughout (same cadence)
+  early_every_steps: 10      # Every 10 steps in early phase (was 5)
+  late_every_steps: 20       # Every 20 steps late phase (was 5)
   keep_last_n: 10
   save_optimizer: true
 
@@ -85,15 +85,15 @@ probes:
     top_k_mass: true
     top_k_values: [1, 5, 10]
   layers: [0, 4, 8, 12, 16, 20, 23]
-  fixed_every_steps: 5  # Every 5 steps
+  fixed_every_steps: 10  # Every 10 steps (was 2 - too frequent)
 
 activations:
   enabled: true
   # Fraction-based phases scale with step_multiplier
   early_until_fraction: 1.0  # All steps use early cadence (uniform capture)
-  early_every_steps: 5       # Every 5 steps
-  mid_every_steps: 5         # (not used when early_until_fraction=1.0)
-  late_every_steps: 5        # (not used when early_until_fraction=1.0)
+  early_every_steps: 10      # Every 10 steps (was 2 - too frequent, caused GPU stalls)
+  mid_every_steps: 10        # (not used when early_until_fraction=1.0)
+  late_every_steps: 10       # (not used when early_until_fraction=1.0)
   capture:
     x_in: true
     attn_out: true
